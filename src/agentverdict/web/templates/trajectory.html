@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+
+{% block title %}{{ task.key }} · AgentVerdict{% endblock %}
+
+{% block content %}
+<div class="page-nav">
+  <a href="/label">&larr; Back to queue</a>
+  {% if next_unlabeled_id %}
+    <a href="/label/{{ next_unlabeled_id }}">Skip to next unlabeled &rarr;</a>
+  {% endif %}
+</div>
+
+<h1>{{ task.key }}</h1>
+<p>
+  <span class="badge status-{{ trajectory.status }}">{{ trajectory.status }}</span>
+  <span class="muted">
+    source: {{ trajectory.source }} &middot; {{ steps | length }} steps &middot;
+    recorded {{ trajectory.created_at | fmt_dt }} &middot;
+    <span class="mono">{{ trajectory.id }}</span>
+  </span>
+</p>
+
+<div class="card task-card">
+  <div class="label">Task prompt</div>
+  <p>{{ task.prompt }}</p>
+  {% if task.expected_outcome %}
+  <div class="label">Expected outcome</div>
+  <p>{{ task.expected_outcome }}</p>
+  {% endif %}
+</div>
+
+<section class="steps">
+  <h2>Trajectory</h2>
+  {% for step in steps %}
+  <div class="step step-{{ step.type }}">
+    <div class="step-meta">
+      <span class="badge type-{{ step.type }}">{{ step.index }} &middot; {{ step.type.replace('_', ' ') }}</span>
+      {% if step.type in ('tool_call', 'tool_result') and step.content.get('name') %}
+        <span class="tool-name mono">{{ step.content.get('name') }}</span>
+      {% endif %}
+      {% if step.type == 'tool_result' and step.content.get('is_error') %}
+        <span class="badge verdict-fail">error</span>
+      {% endif %}
+    </div>
+    {% if step.type in ('tool_call', 'tool_result') %}
+      <pre class="tool-json{% if step.content.get('is_error') %} error{% endif %}">{{ step.content | tojson_pretty }}</pre>
+    {% elif step.content.get('text') %}
+      <div class="bubble">{{ step.content.get('text') }}</div>
+    {% else %}
+      <pre class="tool-json">{{ step.content | tojson_pretty }}</pre>
+    {% endif %}
+  </div>
+  {% else %}
+  <p class="muted">This trajectory has no steps.</p>
+  {% endfor %}
+</section>
+
+<section>
+  <h2>Existing labels ({{ labels | length }})</h2>
+  {% if labels %}
+  <div class="card">
+    {% for label in labels %}
+    <div class="label-row">
+      <span class="badge verdict-{{ label.verdict }}">{{ label.verdict }}</span>
+      <strong>{{ label.annotator }}</strong>
+      <span class="muted">{{ label.created_at | fmt_dt }}</span>
+      {% if label.rationale %}<p class="rationale">{{ label.rationale }}</p>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="muted">No labels yet &mdash; yours will be the first.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Your label</h2>
+  {% if form_error %}<p class="form-error">{{ form_error }}</p>{% endif %}
+  <div class="card">
+    <form class="label-form" id="label-form" method="post" action="/label/{{ trajectory.id }}">
+      <div class="field">
+        <label class="field-name" for="annotator">Annotator</label>
+        <input type="text" id="annotator" name="annotator" value="{{ form_annotator }}"
+               required maxlength="100" autocomplete="name" placeholder="your name"
+               {% if not form_annotator %}autofocus{% endif %}>
+      </div>
+      <fieldset class="field">
+        <legend>Verdict</legend>
+        <div class="verdict-options">
+          <label class="verdict-option">
+            <input type="radio" name="verdict" value="pass" required
+                   {% if form_verdict == 'pass' %}checked{% endif %}>
+            pass <kbd>1</kbd>
+          </label>
+          <label class="verdict-option">
+            <input type="radio" name="verdict" value="fail"
+                   {% if form_verdict == 'fail' %}checked{% endif %}>
+            fail <kbd>2</kbd>
+          </label>
+          <label class="verdict-option">
+            <input type="radio" name="verdict" value="borderline"
+                   {% if form_verdict == 'borderline' %}checked{% endif %}>
+            borderline <kbd>3</kbd>
+          </label>
+        </div>
+      </fieldset>
+      <div class="field">
+        <label class="field-name" for="rationale">Rationale <span class="muted">(optional)</span></label>
+        <textarea id="rationale" name="rationale" rows="3"
+                  placeholder="Why this verdict?">{{ form_rationale }}</textarea>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn primary">Save &amp; next</button>
+        <span class="muted">
+          <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> pick verdict &middot;
+          <kbd>Ctrl</kbd>+<kbd>Enter</kbd> save
+        </span>
+      </div>
+    </form>
+  </div>
+</section>
+
+<script>
+  (function () {
+    var form = document.getElementById("label-form");
+    var verdictKeys = { "1": "pass", "2": "fail", "3": "borderline" };
+    document.addEventListener("keydown", function (event) {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        if (form.requestSubmit) { form.requestSubmit(); } else { form.submit(); }
+        return;
+      }
+      if (event.ctrlKey || event.metaKey || event.altKey) { return; }
+      var el = document.activeElement;
+      var typing = el && (el.tagName === "TEXTAREA" ||
+        (el.tagName === "INPUT" && el.type === "text"));
+      if (typing) { return; }
+      var verdict = verdictKeys[event.key];
+      if (verdict) {
+        var radio = form.querySelector('input[name="verdict"][value="' + verdict + '"]');
+        if (radio) {
+          radio.checked = true;
+          radio.focus();
+          event.preventDefault();
+        }
+      }
+    });
+  })();
+</script>
+{% endblock %}

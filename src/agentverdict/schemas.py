@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 StepType = Literal["user_message", "assistant_message", "tool_call", "tool_result", "system"]
 TrajectoryStatus = Literal["completed", "error", "truncated"]
+TrajectorySource = Literal["api", "import", "manual", "langfuse"]
 LabelVerdict = Literal["pass", "fail", "borderline"]
 
 
@@ -51,7 +52,7 @@ class TrajectoryCreate(BaseModel):
     task_id: str | None = None
     task_key: str | None = None
     agent_config: dict[str, Any] = Field(default_factory=dict)
-    source: str = "api"
+    source: TrajectorySource = "api"
     status: TrajectoryStatus = "completed"
     meta: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime | None = None

@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AgentVerdict{% endblock %}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #f6f7f9;
+      color: #1f2733;
+      font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    }
+    a { color: #3949ab; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre, .mono {
+      font-family: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
+    }
+    .topbar {
+      background: #ffffff;
+      border-bottom: 1px solid #e3e7ee;
+      padding: 0.7rem 1.25rem;
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+    }
+    .topbar .brand { font-weight: 700; font-size: 1.05rem; color: #1f2733; }
+    .topbar .tagline { color: #6b7686; font-size: 0.85rem; }
+    main { max-width: 60rem; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+    h1 { font-size: 1.4rem; margin: 0.5rem 0 1rem; }
+    h2 { font-size: 1.05rem; margin: 2rem 0 0.75rem; }
+    .muted { color: #6b7686; }
+    .card {
+      background: #ffffff;
+      border: 1px solid #e3e7ee;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+    }
+    .btn {
+      display: inline-block;
+      border: 1px solid #cdd4e0;
+      border-radius: 6px;
+      background: #ffffff;
+      color: #1f2733;
+      padding: 0.45rem 1rem;
+      font-size: 0.95rem;
+      cursor: pointer;
+    }
+    .btn:hover { background: #f0f2f7; text-decoration: none; }
+    .btn.primary { background: #3949ab; border-color: #3949ab; color: #ffffff; }
+    .btn.primary:hover { background: #303f9f; }
+    .badge {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 0.1rem 0.6rem;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .status-completed { background: #e6f4ea; color: #1e7e34; }
+    .status-error { background: #fdecea; color: #c62828; }
+    .status-truncated { background: #fff8e1; color: #b26a00; }
+    .verdict-pass { background: #e6f4ea; color: #1e7e34; }
+    .verdict-fail { background: #fdecea; color: #c62828; }
+    .verdict-borderline { background: #fff8e1; color: #b26a00; }
+    .type-user_message { background: #e8f0fe; color: #1a56b0; }
+    .type-assistant_message { background: #e6f4ea; color: #1e7e34; }
+    .type-system { background: #eceff1; color: #546e7a; }
+    .type-tool_call { background: #fff3e0; color: #b35300; }
+    .type-tool_result { background: #f3e8fd; color: #6a3fb5; }
+    kbd {
+      background: #eef1f6;
+      border: 1px solid #cdd4e0;
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      padding: 0 0.35rem;
+      font-size: 0.78rem;
+      font-family: inherit;
+    }
+    /* Queue */
+    .queue-stats {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-bottom: 1rem;
+    }
+    .queue-stats .count { font-size: 1rem; }
+    table.queue {
+      width: 100%;
+      border-collapse: collapse;
+      background: #ffffff;
+      border: 1px solid #e3e7ee;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    table.queue th, table.queue td {
+      padding: 0.55rem 0.9rem;
+      text-align: left;
+      border-bottom: 1px solid #eef1f6;
+      font-size: 0.92rem;
+    }
+    table.queue th {
+      background: #f8f9fc;
+      color: #6b7686;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    table.queue tr:last-child td { border-bottom: none; }
+    table.queue tbody tr:hover td { background: #f5f7fd; }
+    table.queue td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    table.queue tr.labeled td { color: #6b7686; }
+    table.queue tr.labeled td a { color: #6b7686; }
+    /* Trajectory detail */
+    .page-nav {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      font-size: 0.92rem;
+    }
+    .task-card p { margin: 0.4rem 0 0; white-space: pre-wrap; }
+    .task-card .label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: #6b7686;
+      margin-top: 0.9rem;
+    }
+    .task-card .label:first-child { margin-top: 0; }
+    .steps { margin-top: 1.5rem; }
+    .step { margin: 0.9rem 0; }
+    .step-meta {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.25rem;
+    }
+    .step-meta .tool-name { font-size: 0.82rem; color: #6b7686; }
+    .bubble {
+      border: 1px solid #e3e7ee;
+      border-radius: 10px;
+      background: #ffffff;
+      padding: 0.6rem 0.9rem;
+      max-width: 46rem;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+    }
+    .step-user_message .bubble { background: #e8f0fe; border-color: #d2e0fb; }
+    .step-assistant_message .bubble { background: #ffffff; }
+    .step-assistant_message { padding-left: 2.5rem; }
+    .step-system .bubble { background: #f4f6f8; color: #546e7a; font-style: italic; }
+    pre.tool-json {
+      background: #f8f9fc;
+      border: 1px solid #e3e7ee;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      margin: 0;
+      max-width: 46rem;
+      overflow-x: auto;
+      font-size: 0.83rem;
+      line-height: 1.45;
+    }
+    pre.tool-json.error { background: #fdecea; border-color: #f6c9c5; }
+    .step-tool_call, .step-tool_result { padding-left: 1.25rem; }
+    /* Labels + form */
+    .label-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.6rem;
+      padding: 0.55rem 0;
+      border-bottom: 1px solid #eef1f6;
+    }
+    .label-row:last-child { border-bottom: none; }
+    .label-row .rationale {
+      flex-basis: 100%;
+      margin: 0;
+      color: #444e5c;
+      white-space: pre-wrap;
+    }
+    form.label-form .field { margin-bottom: 1rem; }
+    form.label-form label.field-name, form.label-form legend {
+      display: block;
+      font-weight: 600;
+      font-size: 0.9rem;
+      margin-bottom: 0.3rem;
+      padding: 0;
+    }
+    form.label-form input[type="text"], form.label-form textarea {
+      width: 100%;
+      max-width: 30rem;
+      border: 1px solid #cdd4e0;
+      border-radius: 6px;
+      padding: 0.45rem 0.6rem;
+      font: inherit;
+      background: #ffffff;
+      color: #1f2733;
+    }
+    form.label-form input[type="text"]:focus, form.label-form textarea:focus {
+      outline: 2px solid #93a4e8;
+      outline-offset: 0;
+      border-color: #3949ab;
+    }
+    form.label-form fieldset { border: none; margin: 0; padding: 0; }
+    .verdict-options { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .verdict-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      border: 1px solid #cdd4e0;
+      border-radius: 6px;
+      background: #ffffff;
+      padding: 0.4rem 0.8rem;
+      cursor: pointer;
+      font-size: 0.95rem;
+    }
+    .verdict-option:hover { background: #f0f2f7; }
+    .verdict-option:has(input:checked) { border-color: #3949ab; background: #e8f0fe; }
+    .verdict-option input { accent-color: #3949ab; margin: 0; }
+    .form-actions {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-top: 1.25rem;
+    }
+    .form-error {
+      background: #fdecea;
+      border: 1px solid #f6c9c5;
+      border-radius: 6px;
+      color: #c62828;
+      padding: 0.55rem 0.9rem;
+      margin: 0 0 1rem;
+    }
+    .empty {
+      background: #ffffff;
+      border: 1px dashed #cdd4e0;
+      border-radius: 8px;
+      padding: 2rem;
+      text-align: center;
+      color: #6b7686;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/label">AgentVerdict</a>
+    <span class="tagline">golden-dataset labeling</span>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

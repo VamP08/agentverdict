@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}Labeling queue · AgentVerdict{% endblock %}
+
+{% block content %}
+<h1>Labeling queue</h1>
+
+<div class="queue-stats">
+  <span class="count">
+    <strong>{{ labeled_count }}</strong> of <strong>{{ total_count }}</strong> trajectories labeled
+  </span>
+  {% if first_unlabeled_id %}
+    <a class="btn primary" href="/label/{{ first_unlabeled_id }}">Start labeling</a>
+    <span class="muted">{{ total_count - labeled_count }} remaining</span>
+  {% elif total_count %}
+    <span class="badge verdict-pass">all done</span>
+  {% endif %}
+</div>
+
+{% if trajectories %}
+<table class="queue">
+  <thead>
+    <tr>
+      <th>Task</th>
+      <th>Status</th>
+      <th>Steps</th>
+      <th>Labels</th>
+      <th>Created</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in trajectories %}
+    <tr class="{{ 'labeled' if t.label_count else 'unlabeled' }}">
+      <td><a href="/label/{{ t.id }}">{{ t.task_key }}</a></td>
+      <td><span class="badge status-{{ t.status }}">{{ t.status }}</span></td>
+      <td class="num">{{ t.step_count }}</td>
+      <td class="num">{{ t.label_count }}</td>
+      <td class="muted">{{ t.created_at | fmt_dt }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">
+  <p>No trajectories yet.</p>
+  <p>Import a bundle with <code>agentverdict import examples/sample_trajectories.jsonl</code>,
+  then refresh this page.</p>
+</div>
+{% endif %}
+{% endblock %}

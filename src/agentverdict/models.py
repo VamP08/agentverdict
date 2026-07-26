@@ -8,7 +8,7 @@ milestones (see DESIGN.md).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import (
     JSON,
@@ -18,8 +18,10 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
 )
+from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -28,7 +30,31 @@ def new_id() -> str:
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
+
+
+class TZDateTime(TypeDecorator):
+    """Store datetimes as naive UTC; return them tz-aware (UTC) on load.
+
+    SQLite discards tzinfo on write and Postgres re-interprets it against the
+    connection timezone, so normalizing at the type boundary keeps timestamps
+    identical across backends and across API create/read round trips.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value  # naive input is treated as UTC
+        return value.astimezone(UTC).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=UTC)
 
 
 class Base(DeclarativeBase):
@@ -45,7 +71,7 @@ class Rubric(Base):
     name: Mapped[str] = mapped_column(String(200))
     version: Mapped[int] = mapped_column(Integer, default=1)
     criteria: Mapped[list] = mapped_column(JSON, default=list)  # [{key, description, weight}]
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
 
 
 class Task(Base):
@@ -59,7 +85,7 @@ class Task(Base):
     tools_spec: Mapped[list] = mapped_column(JSON, default=list)
     expected_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
     tags: Mapped[list] = mapped_column(JSON, default=list)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
 
     trajectories: Mapped[list[Trajectory]] = relationship(back_populates="task")
 
@@ -75,9 +101,9 @@ class Trajectory(Base):
     source: Mapped[str] = mapped_column(String(32), default="api")
     status: Mapped[str] = mapped_column(String(32), default="completed")
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
 
     task: Mapped[Task] = relationship(back_populates="trajectories")
     steps: Mapped[list[Step]] = relationship(
@@ -123,6 +149,6 @@ class HumanLabel(Base):
     rubric_scores: Mapped[dict] = mapped_column(JSON, default=dict)
     rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
     time_spent_s: Mapped[float | None] = mapped_column(Float, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
 
     trajectory: Mapped[Trajectory] = relationship(back_populates="labels")
