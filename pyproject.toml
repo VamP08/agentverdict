@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentverdict"
+version = "0.1.0"
+description = "CI-native evaluation platform for tool-calling AI agents, with a human-calibrated judge"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "typer>=0.12",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "psycopg[binary]>=3.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "httpx>=0.27",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+agentverdict = "agentverdict.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentverdict"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
