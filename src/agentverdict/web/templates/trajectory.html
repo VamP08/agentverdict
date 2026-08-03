@@ -120,6 +120,32 @@
   </div>
 </section>
 
+{% if judge_verdicts %}
+<section>
+  <h2>Judge verdicts ({{ judge_verdicts | length }})</h2>
+  <p class="muted">Shown below the label form so your judgment stays independent.</p>
+  <div class="card">
+    {% for verdict_row, judge in judge_verdicts %}
+    <div class="label-row">
+      {% if verdict_row.verdict %}
+        <span class="badge verdict-{{ verdict_row.verdict }}">{{ verdict_row.verdict }}</span>
+      {% else %}
+        <span class="badge verdict-fail">error</span>
+      {% endif %}
+      <strong>{{ judge.name }}</strong>
+      <span class="muted mono">{{ judge.model }}</span>
+      <span class="muted">
+        {{ verdict_row.created_at | fmt_dt }}
+        {% if verdict_row.latency_ms %}&middot; {{ '%.0f' % verdict_row.latency_ms }} ms{% endif %}
+      </span>
+      {% if verdict_row.rationale %}<p class="rationale">{{ verdict_row.rationale }}</p>{% endif %}
+      {% if verdict_row.error %}<p class="rationale">{{ verdict_row.error }}</p>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 <script>
   (function () {
     var form = document.getElementById("label-form");

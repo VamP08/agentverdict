@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from agentverdict.db import get_session
-from agentverdict.models import HumanLabel, Step, Task, Trajectory
+from agentverdict.models import HumanLabel, Judge, JudgeVerdict, Step, Task, Trajectory
 from agentverdict.schemas import TrajectorySummary
 
 VERDICTS = ("pass", "fail", "borderline")
@@ -74,11 +74,18 @@ def _render_trajectory(
     status_code: int = 200,
 ) -> Response:
     labels = sorted(trajectory.labels, key=lambda label: (label.created_at, label.id))
+    judge_verdicts = session.execute(
+        select(JudgeVerdict, Judge)
+        .join(Judge, JudgeVerdict.judge_id == Judge.id)
+        .where(JudgeVerdict.trajectory_id == trajectory.id)
+        .order_by(JudgeVerdict.created_at.desc(), JudgeVerdict.id)
+    ).all()
     context = {
         "trajectory": trajectory,
         "task": trajectory.task,
         "steps": trajectory.steps,
         "labels": labels,
+        "judge_verdicts": judge_verdicts,
         "next_unlabeled_id": _next_unlabeled_id(session, exclude_id=trajectory.id),
         "form_annotator": form_annotator,
         "form_verdict": form_verdict,

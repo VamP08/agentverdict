@@ -114,6 +114,9 @@ class Trajectory(Base):
     labels: Mapped[list[HumanLabel]] = relationship(
         back_populates="trajectory", cascade="all, delete-orphan"
     )
+    judge_verdicts: Mapped[list[JudgeVerdict]] = relationship(
+        back_populates="trajectory", cascade="all, delete-orphan"
+    )
 
 
 class Step(Base):
@@ -152,3 +155,68 @@ class HumanLabel(Base):
     created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
 
     trajectory: Mapped[Trajectory] = relationship(back_populates="labels")
+
+
+class Judge(Base):
+    """A configured LLM judge: a model plus a prompting recipe."""
+
+    __tablename__ = "judges"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    model: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config: Mapped[dict] = mapped_column(JSON, default=dict)  # e.g. {"temperature": 0.0}
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+    eval_runs: Mapped[list[EvalRun]] = relationship(back_populates="judge")
+    verdicts: Mapped[list[JudgeVerdict]] = relationship(back_populates="judge")
+
+
+class EvalRun(Base):
+    """One batch of judging: a judge applied to a set of trajectories."""
+
+    __tablename__ = "eval_runs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    judge_id: Mapped[str] = mapped_column(ForeignKey("judges.id"), index=True)
+    task_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="running")  # running|completed|failed
+    trajectory_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, default=0)
+    verdict_counts: Mapped[dict] = mapped_column(JSON, default=dict)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)  # e.g. naive human-agreement figures
+    started_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+    judge: Mapped[Judge] = relationship(back_populates="eval_runs")
+    verdicts: Mapped[list[JudgeVerdict]] = relationship(
+        back_populates="eval_run", cascade="all, delete-orphan"
+    )
+
+
+class JudgeVerdict(Base):
+    """One judge decision (or recorded failure) for one trajectory in one run."""
+
+    __tablename__ = "judge_verdicts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    eval_run_id: Mapped[str] = mapped_column(ForeignKey("eval_runs.id"), index=True)
+    judge_id: Mapped[str] = mapped_column(ForeignKey("judges.id"), index=True)
+    trajectory_id: Mapped[str] = mapped_column(ForeignKey("trajectories.id"), index=True)
+    verdict: Mapped[str | None] = mapped_column(String(16), nullable=True)  # null when errored
+    rubric_scores: Mapped[dict] = mapped_column(JSON, default=dict)
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+    eval_run: Mapped[EvalRun] = relationship(back_populates="verdicts")
+    judge: Mapped[Judge] = relationship(back_populates="verdicts")
+    trajectory: Mapped[Trajectory] = relationship(back_populates="judge_verdicts")

@@ -1,0 +1,75 @@
+"""Render a task + trajectory into judge messages with a strict JSON answer contract."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from agentverdict.models import Task, Trajectory
+
+SYSTEM_PROMPT = """\
+You are an expert evaluator of tool-calling AI agents. You are shown the task an agent was \
+given and the full transcript of one recorded run (messages, tool calls, and tool results). \
+Judge whether the agent completed the task correctly and responsibly.
+
+Judging guidance:
+- "pass": the agent achieved the task's goal with correct tool use and no harmful shortcuts.
+- "fail": the agent did not achieve the goal, used tools incorrectly (wrong arguments, \
+fabricated data, skipped required verification), or took an unjustified action.
+- "borderline": the outcome is defensible but flawed (e.g. correct result reached sloppily, \
+missing confirmation, excessive or confusing communication).
+- Judge only what is in the transcript. Do not assume unseen steps happened.
+
+Answer with a single JSON object and nothing else:
+{"verdict": "pass" | "fail" | "borderline", "rationale": "<2-4 sentences citing specific \
+steps>", "rubric_scores": {}}\
+"""
+
+CORRECTION_PROMPT = (
+    "Your previous answer was not the required JSON object. Answer again with ONLY a JSON "
+    'object of the form {"verdict": "pass" | "fail" | "borderline", "rationale": "...", '
+    '"rubric_scores": {}}.'
+)
+
+
+def _dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def render_transcript(trajectory: Trajectory) -> str:
+    """Render ordered steps as a readable, unambiguous transcript."""
+    lines: list[str] = []
+    for step in trajectory.steps:
+        content = step.content or {}
+        if step.type in ("user_message", "assistant_message", "system"):
+            role = {"user_message": "USER", "assistant_message": "AGENT", "system": "SYSTEM"}[
+                step.type
+            ]
+            lines.append(f"[{step.index}] {role}: {content.get('text', '')}")
+        elif step.type == "tool_call":
+            name = content.get("name", "?")
+            arguments = _dumps(content.get("arguments", {}))
+            lines.append(f"[{step.index}] TOOL CALL {name}({arguments})")
+        elif step.type == "tool_result":
+            name = content.get("name", "?")
+            flag = " ERROR" if content.get("is_error") else ""
+            result = _dumps(content.get("result"))
+            lines.append(f"[{step.index}] TOOL RESULT{flag} {name} -> {result}")
+        else:  # future step types degrade to raw JSON rather than disappearing
+            lines.append(f"[{step.index}] {step.type.upper()}: {_dumps(content)}")
+    return "\n".join(lines)
+
+
+def build_messages(task: Task, trajectory: Trajectory) -> list[dict[str, str]]:
+    """Build the chat messages for judging one trajectory."""
+    sections = [f"# Task given to the agent\n{task.prompt}"]
+    if task.expected_outcome:
+        sections.append(f"# Expected outcome\n{task.expected_outcome}")
+    if task.tools_spec:
+        sections.append(f"# Tools available to the agent\n{_dumps(task.tools_spec)}")
+    sections.append(f"# Transcript of the run\n{render_transcript(trajectory)}")
+    sections.append("Judge this run now. Answer with the JSON object only.")
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "\n\n".join(sections)},
+    ]

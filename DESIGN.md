@@ -13,8 +13,8 @@ update it deliberately when a decision changes.
 
 | # | Milestone | Status |
 |---|-----------|--------|
-| M1 | Golden-dataset workbench: tasks, trajectories, human labels; JSONL import/export; browser labeling UI | **in progress** |
-| M2 | Eval runner: replay tasks against agents, LLM-as-judge scoring via Groq | planned |
+| M1 | Golden-dataset workbench: tasks, trajectories, human labels; JSONL import/export; browser labeling UI | done |
+| M2 | Eval runner: replay tasks against agents, LLM-as-judge scoring via Groq | **in progress** |
 | M3 | Calibration lab: judge-vs-human agreement (kappa), position/verbosity/self-preference bias stats | planned |
 | M4 | Distilled 4B judge: fine-tune on accumulated judgments, serve locally, publish to HF Hub | planned |
 | M5 | CI integration: GitHub Action, cost-bounded suites, bootstrapped confidence intervals, merge gating | planned |
@@ -32,6 +32,40 @@ Everything needed to build and label a golden dataset, with zero LLM calls:
 
 Explicitly deferred: auth, Alembic migrations (M1 uses `Base.metadata.create_all`), pgvector and
 embeddings (M2+), judge tables (M2), async SQLAlchemy (sync is fine at this scale).
+
+## M2 scope
+
+Two halves; the judging half ships first, the replay half second.
+
+**Part 1 — LLM-as-judge (shipped):**
+
+1. **Tables** — `judges` (a named model + prompting recipe), `eval_runs` (one batch of judging),
+   `judge_verdicts` (one decision or recorded failure per trajectory per run). A judge may score
+   the same trajectory across multiple runs — repeat sampling feeds M3 consistency analysis.
+2. **Groq client** (`judging/client.py`) — hand-rolled `httpx` client against Groq's
+   OpenAI-compatible `/chat/completions` with JSON response format, bounded retries on 429/5xx
+   (honoring `Retry-After`), latency and token-usage capture. `httpx` is therefore promoted from
+   a dev-only to a runtime dependency (deliberate change, recorded here).
+3. **Prompting** (`judging/prompts.py`) — renders the task (prompt, expected outcome, tools) and
+   the full step transcript into judge messages; the judge must answer with strict JSON
+   `{"verdict": "pass|fail|borderline", "rationale": str, "rubric_scores": {}}`, validated by the
+   `JudgeDecision` schema, with one corrective retry on malformed output.
+4. **Runner** (`judging/runner.py`) — iterates trajectories (optional task filter/limit),
+   persists a `JudgeVerdict` per trajectory (error rows on failure — one bad call never aborts a
+   run), aggregates verdict counts and token totals onto the `EvalRun`, and computes a naive
+   human-agreement figure (judge vs. per-trajectory human majority) stored in `EvalRun.meta`.
+   Cohen's kappa and bias analysis stay in M3.
+5. **Surfaces** — CLI `agentverdict judge add|list|run`; `GET /api/judges` and
+   `GET /api/trajectories/{id}/verdicts`; judge verdicts rendered on the labeling UI trajectory
+   page (humans label first, then compare — the UI shows judge verdicts below the label form).
+6. **Config** — `AGENTVERDICT_GROQ_API_KEY` (falls back to plain `GROQ_API_KEY`),
+   `AGENTVERDICT_JUDGE_MODEL` (default `llama-3.3-70b-versatile`), base URL and timeout.
+   Tests never hit the network: the client accepts an injected `httpx` transport.
+
+**Part 2 — task replay (next):** an agent adapter interface that executes an agent against
+stored tasks (starting with a built-in Groq tool-calling reference agent using each task's
+`tools_spec` with mocked tools) and records fresh trajectories, plus `agentverdict eval`
+combining replay + judging.
 
 ## Repository layout
 
@@ -51,13 +85,19 @@ agentverdict/
 │   ├── models.py             # SQLAlchemy 2.0 models (frozen core)
 │   ├── schemas.py            # Pydantic v2 schemas (frozen core)
 │   ├── importer.py           # JSONL import/export + stats
-│   ├── cli.py                # Typer app: init-db, import, export, stats, serve
+│   ├── cli.py                # Typer app: init-db, import, export, stats, serve, judge
+│   ├── judging/
+│   │   ├── __init__.py
+│   │   ├── client.py         # Groq chat client (httpx, retries, token usage)
+│   │   ├── prompts.py        # transcript rendering + judge message construction
+│   │   └── runner.py         # eval-run orchestration + verdict persistence
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── app.py            # create_app() factory + module-level `app = create_app()`
 │   │   ├── routes_tasks.py
 │   │   ├── routes_trajectories.py
-│   │   └── routes_labels.py
+│   │   ├── routes_labels.py
+│   │   └── routes_judges.py
 │   └── web/
 │       ├── __init__.py
 │       ├── routes.py         # exposes `router: APIRouter` (labeling UI)
@@ -84,6 +124,16 @@ agentverdict/
   Unique `(trajectory_id, annotator)`; **re-submitting for the same annotator replaces the
   existing label** (update in place).
 - **rubrics** — dormant in M1 (no routes); versioned criteria for M3 calibration.
+- **judges** — `id`, `name` (unique), `model`, `description` (nullable), `config` (JSON, e.g.
+  `{"temperature": 0.0}`), `created_at`.
+- **eval_runs** — `id`, `judge_id` (FK), `task_key` (nullable filter), `status`
+  (`running|completed|failed`), `trajectory_count`, `error_count`, `verdict_counts` (JSON),
+  `input_tokens`/`output_tokens`, `meta` (JSON; holds the naive human-agreement figures),
+  `started_at`/`completed_at`, `created_at`.
+- **judge_verdicts** — `id`, `eval_run_id` (FK), `judge_id` (FK), `trajectory_id` (FK),
+  `verdict` (nullable — null when the call errored), `rubric_scores` (JSON), `rationale`
+  (nullable), `error` (nullable), `raw_response` (JSON, nullable), `latency_ms`,
+  `input_tokens`/`output_tokens`, `created_at`. No uniqueness across runs by design.
 
 Step `content` conventions:
 - `user_message` / `assistant_message` / `system`: `{"text": str}`
@@ -126,6 +176,8 @@ All JSON routes under `/api`; the labeling UI is served at `/label`. `app.py` ex
   `GET /api/trajectories/{id}` (full, with steps)
 - `POST /api/trajectories/{id}/labels` (LabelCreate; replaces same-annotator label) → LabelRead
 - `GET  /api/trajectories/{id}/labels`
+- `GET  /api/judges` (list) — judges are created via the CLI in M2
+- `GET  /api/trajectories/{id}/verdicts` (judge verdicts, newest first; 404 unknown trajectory)
 
 The web router (`agentverdict/web/routes.py`) exposes `router` and is mounted by `create_app()`:
 - `GET  /label` — queue: unlabeled trajectories first, then labeled; links to detail
@@ -140,6 +192,10 @@ The web router (`agentverdict/web/routes.py`) exposes `router` and is mounted by
 - `export PATH [--task-key KEY]` — export trajectories to JSONL
 - `stats` — counts: tasks, trajectories, labels, label coverage, verdict histogram
 - `serve [--host --port --reload]` — run uvicorn on `agentverdict.api.app:app`
+- `judge add NAME [--model --description]` — register a judge (model defaults from settings)
+- `judge list` — judges with verdict counts
+- `judge run NAME [--task-key --limit]` — judge trajectories, print per-trajectory progress and
+  a summary (verdict histogram, tokens, error count, naive human agreement when labels exist)
 
 ## Conventions
 

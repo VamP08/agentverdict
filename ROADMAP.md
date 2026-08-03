@@ -3,7 +3,7 @@
 Six milestones, each shippable on its own. Statuses mirror [DESIGN.md](DESIGN.md), which is the
 authoritative spec.
 
-## M1 — Golden-dataset workbench (in progress)
+## M1 — Golden-dataset workbench (done)
 
 Store tasks, recorded agent trajectories, and human labels; build golden datasets with zero LLM
 calls.
@@ -19,15 +19,17 @@ calls.
 - [x] CLI (`init-db`, `import`, `export`, `stats`, `serve`), pytest suite on in-memory SQLite,
       ruff-clean, CI workflow, docker-compose for Postgres
 
-## M2 — Eval runner (planned)
+## M2 — Eval runner (in progress)
 
 Replay tasks against agents and score the results with an LLM judge.
 
+- [x] LLM-as-judge scoring via Groq with structured verdicts persisted alongside trajectories
+- [x] Judge, eval-run, and judge-verdict tables added to the data model
+- [x] `agentverdict judge` CLI (add / list / run) printing a scored summary with a naive
+      human-agreement readout; judge verdicts surfaced in the labeling UI and API
 - [ ] Task replay harness that executes an agent against stored tasks and records new
       trajectories automatically
-- [ ] LLM-as-judge scoring via Groq with structured verdicts persisted alongside trajectories
-- [ ] Judge and eval-run tables added to the data model (first Alembic migration)
-- [ ] `agentverdict eval` CLI to run a suite end-to-end and print a scored summary
+- [ ] `agentverdict eval` CLI combining replay + judging into one end-to-end suite run
 
 ## M3 — Calibration lab (planned)
 

@@ -108,6 +108,66 @@ class LabelRead(LabelCreate):
     created_at: datetime
 
 
+# --- Judging (M2) ------------------------------------------------------------
+
+
+class JudgeDecision(BaseModel):
+    """The strict-JSON contract the LLM judge must answer with."""
+
+    verdict: LabelVerdict
+    rationale: str = Field(min_length=1)
+    rubric_scores: dict[str, float] = Field(default_factory=dict)
+
+
+class JudgeCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    model: str = Field(min_length=1, max_length=200)
+    description: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class JudgeRead(JudgeCreate):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    created_at: datetime
+
+
+class JudgeVerdictRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    eval_run_id: str
+    judge_id: str
+    trajectory_id: str
+    verdict: str | None
+    rubric_scores: dict[str, float] = Field(default_factory=dict)
+    rationale: str | None
+    error: str | None
+    latency_ms: float | None
+    input_tokens: int
+    output_tokens: int
+    created_at: datetime
+
+
+class EvalRunRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    judge_id: str
+    task_key: str | None
+    status: str
+    trajectory_count: int
+    error_count: int
+    verdict_counts: dict[str, int] = Field(default_factory=dict)
+    input_tokens: int
+    output_tokens: int
+    meta: dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime
+    completed_at: datetime | None
+    created_at: datetime
+
+
 # --- Import / stats ----------------------------------------------------------
 
 
