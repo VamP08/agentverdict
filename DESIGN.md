@@ -15,7 +15,7 @@ update it deliberately when a decision changes.
 |---|-----------|--------|
 | M1 | Golden-dataset workbench: tasks, trajectories, human labels; JSONL import/export; browser labeling UI | done |
 | M2 | Eval runner: replay tasks against agents, LLM-as-judge scoring via Groq | **in progress** |
-| M3 | Calibration lab: judge-vs-human agreement (kappa), position/verbosity/self-preference bias stats | planned |
+| M3 | Calibration lab: judge-vs-human agreement (kappa), position/verbosity/self-preference bias stats | **in progress** |
 | M4 | Distilled 4B judge: fine-tune on accumulated judgments, serve locally, publish to HF Hub | planned |
 | M5 | CI integration: GitHub Action, cost-bounded suites, bootstrapped confidence intervals, merge gating | planned |
 | M6 | Public leaderboard + Langfuse online loop (production traces → new eval cases) | planned |
@@ -105,6 +105,49 @@ Two halves; the judging half ships first, the replay half second.
    `serve` therefore run `upgrade head`; `db.init_db()` (create_all) remains the fast path for
    tests. A test asserts `compare_metadata` finds no drift between migrations and the models.
 
+## M3 scope
+
+Part 1 (in progress) answers *how much does the judge agree with us*; part 2 will answer
+*where is it systematically wrong* (position, verbosity, and self-preference probes, plus
+rubric versioning).
+
+**Part 1 — the agreement core:**
+
+1. **Statistics** (`calibration/stats.py`, frozen) — pure standard library. `agreement_stats`
+   returns the confusion matrix, observed agreement, Cohen's kappa, an ordinal linear-weighted
+   kappa (`fail < borderline < pass`, so a pass/fail mix-up costs more than pass/borderline), a
+   seeded percentile-bootstrap CI over trajectory resamples, and per-verdict
+   precision/recall/F1. Every statistic returns `None` rather than a misleading number when
+   undefined (no items, a rater who never varies).
+2. **Report builder** (`calibration/report.py`) — `build_calibration_report(session, judge, *,
+   eval_run_id=None, task_key=None) -> CalibrationReport`. Pairs each trajectory's **human
+   majority verdict** with that judge's **most recent** verdict for it (scoped to one eval run
+   when given). Rows where the judge errored are excluded and counted separately; labeled
+   trajectories with no human majority (a tie) are excluded and counted as `ties_excluded`.
+3. **Human agreement, two ways** — the judge is scored against the human *majority*, and a
+   majority is quieter than any individual annotator, so raw annotator-vs-annotator kappa is not
+   the bar it appears to be: a judge with exactly average human accuracy beats it and looks
+   superhuman. The report therefore leads with a **held-out baseline** (each annotator scored
+   against the majority of the others — the same treatment the judge gets) and shows pairwise
+   agreement underneath as a rubric-health signal. The baseline is scoped to judged
+   trajectories, deliberately *not* to `compared`: with two annotators every disagreement is a
+   tie and is dropped from `compared`, which would score humans only where they already agreed
+   and always report a perfect 1.0.
+4. **Disagreement drill-down** — the trajectories where judge and humans differ, worst first by
+   ordinal distance (pass vs fail before pass vs borderline), each carrying the judge's
+   rationale so a human can see *why* it went wrong. This is the actionable output.
+5. **Surfaces** — `agentverdict calibrate JUDGE [--eval-run --task-key --json]`;
+   `GET /api/judges/{judge_id}/calibration`; a `/calibration` web page (index of judges with
+   their kappa) and `/calibration/{judge_id}` (matrix, ceiling, drill-down linking to each
+   trajectory).
+
+Calibration is computed on demand — there is no report table. Nothing here calls a model: it is
+pure analysis over verdicts already stored, so it is free to run and safe in CI.
+
+**Empty-state matters.** Until trajectories carry both a human label and a judge verdict, every
+statistic is undefined. The report says so explicitly and names the two commands that fix it,
+rather than rendering zeros that look like findings.
+
 ## Repository layout
 
 ```
@@ -129,6 +172,10 @@ agentverdict/
 │   │   ├── client.py         # Groq chat client (httpx, retries, token usage)
 │   │   ├── prompts.py        # transcript rendering + judge message construction
 │   │   └── runner.py         # eval-run orchestration + verdict persistence
+│   ├── calibration/
+│   │   ├── __init__.py
+│   │   ├── stats.py          # kappa, weighted kappa, bootstrap CI, per-class metrics
+│   │   └── report.py         # judge-vs-human report over the golden dataset
 │   ├── api/
 │   │   ├── __init__.py
 │   │   ├── app.py            # create_app() factory + module-level `app = create_app()`

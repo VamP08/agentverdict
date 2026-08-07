@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block title %}Calibration · AgentVerdict{% endblock %}
+
+{% block content %}
+<h1>Judge calibration</h1>
+<p class="muted">
+  How closely each judge tracks the human majority verdict on the golden set.
+  Cohen's kappa is chance-corrected: 0.00 is coin-flip agreement, 1.00 is perfect.
+  Read it against the human ceiling on each judge's report, not against 1.00.
+</p>
+
+{% if reports %}
+<div class="queue-stats">
+  <span class="count">
+    <strong>{{ calibrated_count }}</strong> of <strong>{{ judge_count }}</strong> judges have
+    something to compare
+  </span>
+</div>
+
+<table class="queue">
+  <thead>
+    <tr>
+      <th>Judge</th>
+      <th>Model</th>
+      <th>Compared</th>
+      <th>Cohen's kappa</th>
+      <th>Agreement</th>
+      <th>Report</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for report in reports %}
+    <tr class="{{ 'unlabeled' if report.compared else 'labeled' }}">
+      <td><a href="/calibration/{{ report.judge_id }}">{{ report.judge_name }}</a></td>
+      <td class="mono">{{ report.judge_model }}</td>
+      <td class="num">{{ report.compared }}</td>
+      <td class="num">{{ report.agreement.cohens_kappa | fmt_num }}</td>
+      <td>
+        {% if report.compared %}
+          <span class="badge {{ report.agreement.cohens_kappa | kappa_badge }}">
+            {{- report.agreement.interpretation -}}
+          </span>
+        {% else %}
+          <span class="muted">not yet calibrated</span>
+        {% endif %}
+      </td>
+      <td><a href="/calibration/{{ report.judge_id }}">Open &rarr;</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">
+  <p>No judges registered yet.</p>
+  <p>Register one with <code>agentverdict judge add my-judge</code>, score trajectories with
+  <code>agentverdict judge run my-judge</code>, then come back to see how far it can be trusted.</p>
+</div>
+{% endif %}
+{% endblock %}

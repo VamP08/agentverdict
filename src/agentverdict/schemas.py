@@ -169,6 +169,97 @@ class EvalRunRead(BaseModel):
     created_at: datetime
 
 
+# --- Calibration (M3) --------------------------------------------------------
+
+
+class ClassMetricsRead(BaseModel):
+    label: str
+    support: int
+    predicted: int
+    precision: float | None = None
+    recall: float | None = None
+    f1: float | None = None
+
+
+class AgreementRead(BaseModel):
+    """One rater pair's agreement, serialized for the API and templates."""
+
+    n: int
+    labels: list[str] = Field(default_factory=list)
+    matrix: dict[str, dict[str, int]] = Field(default_factory=dict)
+    observed_agreement: float | None = None
+    cohens_kappa: float | None = None
+    weighted_kappa: float | None = None
+    kappa_ci_low: float | None = None
+    kappa_ci_high: float | None = None
+    interpretation: str = "not enough data"
+    per_class: list[ClassMetricsRead] = Field(default_factory=list)
+    # Resamples that produced a defined kappa, out of those attempted. A shortfall
+    # is why an interval may be missing, and is worth showing rather than hiding.
+    bootstrap_usable: int = 0
+    bootstrap_iterations: int = 0
+
+
+class AnnotatorPairAgreement(BaseModel):
+    """Agreement between two individual humans, on the items both labeled."""
+
+    annotator_a: str
+    annotator_b: str
+    n: int
+    observed_agreement: float | None = None
+    cohens_kappa: float | None = None
+
+
+class HeldOutAnnotatorAgreement(BaseModel):
+    """One human scored the same way the judge is: against a majority of others.
+
+    The judge is compared against the aggregated human majority, which is quieter
+    than any single annotator. Comparing that to raw annotator-vs-annotator
+    agreement is unfair to the judge, so each annotator is also held out and
+    scored against the majority of the rest — the like-for-like reference point.
+    """
+
+    annotator: str
+    n: int
+    observed_agreement: float | None = None
+    cohens_kappa: float | None = None
+
+
+class DisagreementRow(BaseModel):
+    """One trajectory where the judge and the humans reached different verdicts."""
+
+    trajectory_id: str
+    task_key: str
+    human_verdict: str
+    judge_verdict: str
+    distance: int  # steps apart on the ordinal scale; 2 = pass vs fail
+    annotators: list[str] = Field(default_factory=list)
+    judge_rationale: str | None = None
+
+
+class CalibrationReport(BaseModel):
+    """How far a judge can be trusted, measured against the human golden set."""
+
+    judge_id: str
+    judge_name: str
+    judge_model: str
+    eval_run_id: str | None = None
+    task_key: str | None = None
+    generated_at: datetime
+
+    judged_trajectories: int = 0  # trajectories this judge produced a verdict for
+    labeled_trajectories: int = 0  # trajectories carrying at least one human label
+    compared: int = 0  # trajectories with both, i.e. the sample kappa is computed on
+    judge_errors: int = 0  # verdict rows recording a failed call
+    ties_excluded: int = 0  # labeled trajectories with no human majority
+
+    agreement: AgreementRead
+    human_ceiling: list[AnnotatorPairAgreement] = Field(default_factory=list)
+    human_baseline: list[HeldOutAnnotatorAgreement] = Field(default_factory=list)
+    disagreements: list[DisagreementRow] = Field(default_factory=list)
+    disagreements_total: int = 0  # before `disagreements` was truncated for display
+
+
 # --- Replay (M2) -------------------------------------------------------------
 
 

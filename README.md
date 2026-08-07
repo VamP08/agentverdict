@@ -44,8 +44,8 @@ from the accumulated judgments, and the calibrated judge gates pull requests in 
 
 ## Current status
 
-**Milestone 1 — golden-dataset workbench** and **Milestone 2 — eval runner** are done. What
-works today:
+**Milestone 1 — golden-dataset workbench** and **Milestone 2 — eval runner** are done, and
+**Milestone 3 part 1 — judge calibration** has landed. What works today:
 
 - Trajectory store: tasks, multi-step trajectories, and human labels in SQLite or Postgres
 - JSONL import/export of trajectory bundles, with realistic sample data in `examples/`
@@ -57,12 +57,16 @@ works today:
   to stub, no randomness, so a replay is reproducible
 - End-to-end `agentverdict eval`: replay a slice of the task set, judge exactly the runs it
   just produced, and print one combined summary
-- CLI: `init-db`, `import`, `export`, `stats`, `serve`, `judge`, `replay`, `eval`
+- Judge calibration: Cohen's kappa against the human labels, an ordinal weighted kappa, a
+  bootstrap confidence interval, the confusion matrix, the inter-annotator human ceiling, and a
+  ranked drill-down of every disagreement — on the CLI, over the API, and as a `/calibration`
+  page in the browser
+- CLI: `init-db`, `import`, `export`, `stats`, `serve`, `judge`, `replay`, `eval`, `calibrate`
 - REST API under `/api`, test suite, CI workflow, docker-compose for Postgres
 
 The human-labeled dataset stays the ground truth throughout: the judge is scored against it,
-never the other way round. Judge calibration (kappa and bias analysis), the distilled local
-judge, and the CI gate are later milestones; see [ROADMAP.md](ROADMAP.md).
+never the other way round. Bias analysis (position, verbosity, self-preference), the distilled
+local judge, and the CI gate are later milestones; see [ROADMAP.md](ROADMAP.md).
 
 ## Quickstart
 
@@ -177,8 +181,8 @@ totals for the run. Errors are counted rather than fatal: a malformed judge resp
 failed API call is stored on the verdict row and the run continues. When the judged
 trajectories already carry human labels, the summary also prints a naive human-agreement
 figure — judge verdict versus the majority human verdict. Freshly replayed runs are unlabeled,
-so that line only appears on `--skip-replay` runs over the golden set; the real agreement
-statistics (Cohen's kappa, confusion matrix, bias breakdowns) arrive in M3.
+so that line only appears on `--skip-replay` runs over the golden set. It is a rough sanity
+check, not a measurement: the real agreement statistics come from the calibration report below.
 
 ### Why tasks carry a separate user message
 
@@ -210,6 +214,89 @@ output always produce the same tool results, and a replay can be reproduced.
 This is the point of the fixture format: adding a scenario means adding data, not code. Write
 the task (its `key`, grader prompt, `user_message`, `tools_spec`, and expected outcome), add any
 new tool responses to the fixture file, and it is replayable and gradable immediately.
+
+## Calibrating the judge
+
+An uncalibrated judge is not a measurement, it is a number that looks like one. A judge that
+quietly disagrees with your own engineers a third of the time still returns confident `pass`
+verdicts, the summary still looks healthy, and the regression it waved through surfaces when a
+user hits it rather than when CI runs. Calibration puts a figure on that risk before the judge
+is trusted with anything.
+
+Three steps, and only the middle one costs money:
+
+1. **Label trajectories by hand.** `agentverdict serve`, then work the queue at
+   <http://127.0.0.1:8000/label>. A few dozen labeled runs is enough to start.
+2. **Judge the same trajectories.** `agentverdict eval --judge groq-70b --skip-replay` scores
+   what is already in the store instead of replaying fresh, unlabeled runs.
+3. **Compare the two.** `agentverdict calibrate groq-70b`
+
+Calibration never calls a model. It is pure analysis over verdicts already stored, so it needs
+no API key, costs nothing, and is safe to run in CI. Each trajectory contributes one pair: the
+majority human verdict against that judge's most recent verdict for it. Judge calls that errored
+are excluded and counted separately, as are trajectories whose annotators split evenly — neither
+has a ground truth to compare against, and both are reported rather than silently dropped.
+
+What the report gives you:
+
+- **Cohen's kappa** — the headline. Raw agreement flatters a judge on a skewed set: if 80% of
+  your golden set passes, a judge that answers `pass` every single time agrees 80% of the time
+  while knowing nothing. Kappa subtracts the agreement you would expect from chance given how
+  often each rater reaches for each verdict, so 0.0 is "no better than guessing" and 1.0 is
+  perfect. It is printed with the conventional Landis & Koch band — fair, moderate,
+  substantial — so it can be read without living in kappa.
+- **Ordinal weighted kappa** — verdicts are ordered, `fail < borderline < pass`, and the
+  mistakes are not equally bad. Calling a human `pass` a `fail` is an inversion; calling it
+  `borderline` is a hesitation. Plain kappa scores both as simply wrong, so a linear weighted
+  kappa is reported beside it, penalising each disagreement by how far apart the two verdicts
+  sit. Weighted much higher than plain means the judge is hedging, not inverting — a different
+  problem with a different fix.
+- **Bootstrap confidence interval** — golden sets start small, and kappa over 30 items is a
+  noisy estimate. The interval resamples the trajectories with replacement, recomputes kappa on
+  each resample, and reports the middle 95%. A kappa of 0.61 spanning [0.32, 0.83] is not
+  evidence the judge is good; it is evidence you need more labels. The resampling is seeded, so
+  the same rows always yield the same interval.
+- **Confusion matrix and per-verdict precision/recall** — where the disagreement actually lives.
+  It is usually one cell: the judge issuing `pass` where humans said `borderline`.
+- **Disagreement drill-down** — every mismatched trajectory, worst first by ordinal distance
+  (`pass` vs `fail` ahead of `pass` vs `borderline`), each carrying the judge's own rationale.
+  This is the part you act on: read why it went wrong, then either fix the judge prompt or admit
+  the rubric was ambiguous.
+
+### What to compare the judge against
+
+A kappa of 0.68 against humans reads as mediocre until you know what the humans score. The
+report therefore also measures the annotators themselves, two ways — and the distinction
+between them matters more than it looks.
+
+The judge is scored against the **majority** verdict, and aggregating several annotators cancels
+out individual noise. Comparing that to raw annotator-vs-annotator agreement is comparing a
+de-noised reference to a noisy one, which flatters the judge: in simulation, a judge with
+exactly the same error rate as each annotator scores 0.72 against the majority while the
+annotators only reach 0.61 against each other. Read naively, an average judge looks superhuman.
+
+So the report leads with **each annotator held out and scored against the majority of the
+others** — the same treatment the judge gets, and the number to put beside the judge's. In the
+same simulation that baseline is 0.78, correctly placing the judge just below human parity.
+Pairwise annotator agreement is still shown underneath, because it is the right tool for a
+different job: spotting one grader who reads the rubric differently from everyone else.
+
+With exactly two annotators the two figures coincide, since the majority of "everyone else" is
+just the other person.
+
+A low human baseline is the cheapest early warning that a rubric is underspecified: it means
+your own definition of `pass` is not shared, and every number downstream inherits that noise.
+
+Scope a report to one batch with `--eval-run` or to one slice of the task set with `--task-key`,
+and pass `--json` to get the whole report as a single JSON object — what a CI job or a notebook
+should read, instead of parsing the printed tables. The same figures live in the browser UI:
+<http://127.0.0.1:8000/calibration> lists the judges with their kappa, and
+`/calibration/{judge_id}` shows the matrix, the human ceiling, and the drill-down, with each
+disagreement linking straight through to the trajectory.
+
+Until trajectories carry both a human label and a judge verdict there is nothing to pair up and
+every statistic is undefined. The report says so and names the two commands that fix it, rather
+than rendering zeros that look like findings.
 
 ## Architecture
 

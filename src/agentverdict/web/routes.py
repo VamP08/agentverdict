@@ -1,4 +1,4 @@
-"""Server-rendered labeling UI: queue, trajectory detail, and label submission."""
+"""Server-rendered UI: the labeling queue, trajectory detail, and the calibration lab."""
 
 import json
 from datetime import datetime
@@ -12,9 +12,11 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from agentverdict.calibration.report import build_calibration_report
+from agentverdict.calibration.stats import VERDICT_ORDER, interpret_kappa
 from agentverdict.db import get_session
 from agentverdict.models import HumanLabel, Judge, JudgeVerdict, Step, Task, Trajectory
-from agentverdict.schemas import TrajectorySummary
+from agentverdict.schemas import AgreementRead, TrajectorySummary
 
 VERDICTS = ("pass", "fail", "borderline")
 ANNOTATOR_COOKIE = "agentverdict_annotator"
@@ -38,8 +40,36 @@ def _format_dt(value: datetime | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def _format_number(value: float | None, digits: int = 3) -> str:
+    """Statistics print as 'n/a' when undefined, never as a misleading zero."""
+    if value is None:
+        return "n/a"
+    return f"{value:.{digits}f}"
+
+
+def _format_percent(value: float | None, digits: int = 1) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value * 100:.{digits}f}%"
+
+
+def _kappa_badge(value: float | None) -> str:
+    """Badge class for a kappa, so its band reads at a glance in the verdict palette."""
+    if value is None:
+        return "type-system"
+    if value <= 0.40:  # worse than chance, slight, fair
+        return "verdict-fail"
+    if value <= 0.60:  # moderate
+        return "verdict-borderline"
+    return "verdict-pass"  # substantial, almost perfect
+
+
 templates.env.filters["tojson_pretty"] = _pretty_json
 templates.env.filters["fmt_dt"] = _format_dt
+templates.env.filters["fmt_num"] = _format_number
+templates.env.filters["fmt_pct"] = _format_percent
+templates.env.filters["kappa_word"] = interpret_kappa
+templates.env.filters["kappa_badge"] = _kappa_badge
 
 
 def _get_trajectory_or_404(trajectory_id: str, session: Session) -> Trajectory:
@@ -220,3 +250,74 @@ def label_submit(
         samesite="lax",
     )
     return response
+
+
+def _matrix_view(agreement: AgreementRead) -> dict[str, Any]:
+    """Reshape the confusion matrix for rendering: human rows, judge columns, totals.
+
+    The template stays declarative — diagonal (agreement) cells and the marginal
+    totals are decided here rather than recomputed in Jinja.
+    """
+    labels = list(agreement.labels) or list(VERDICT_ORDER)
+    rows: list[dict[str, Any]] = []
+    for human in labels:
+        counts = agreement.matrix.get(human, {})
+        cells = []
+        for judge_verdict in labels:
+            count = counts.get(judge_verdict, 0)
+            classes = []
+            if judge_verdict == human:
+                classes.append("diagonal")  # judge matched the humans
+            if not count:
+                classes.append("zero")
+            cells.append(
+                {"judge": judge_verdict, "count": count, "classes": " ".join(classes)}
+            )
+        rows.append(
+            {"human": human, "cells": cells, "total": sum(cell["count"] for cell in cells)}
+        )
+    column_totals = [
+        {"judge": judge_verdict, "count": sum(row["cells"][position]["count"] for row in rows)}
+        for position, judge_verdict in enumerate(labels)
+    ]
+    total = sum(row["total"] for row in rows)
+    matched = sum(agreement.matrix.get(label, {}).get(label, 0) for label in labels)
+    return {
+        "labels": labels,
+        "rows": rows,
+        "column_totals": column_totals,
+        "total": total,
+        "matched": matched,
+        "mismatched": total - matched,
+    }
+
+
+@router.get("/calibration", response_class=HTMLResponse)
+def calibration_index(request: Request, session: SessionDep) -> Response:
+    """Every registered judge with its headline agreement against the human labels."""
+    judges = list(session.scalars(select(Judge).order_by(Judge.name, Judge.id)))
+    reports = [build_calibration_report(session, judge) for judge in judges]
+    context = {
+        "reports": reports,
+        "judge_count": len(reports),
+        "calibrated_count": sum(1 for report in reports if report.compared > 0),
+    }
+    return templates.TemplateResponse(request, "calibration_index.html", context)
+
+
+@router.get("/calibration/{judge_id}", response_class=HTMLResponse)
+def calibration_detail(request: Request, judge_id: str, session: SessionDep) -> Response:
+    """The full report for one judge: matrix, per-class metrics, ceiling, disagreements."""
+    judge = session.get(Judge, judge_id)
+    if judge is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Judge {judge_id!r} not found",
+        )
+    report = build_calibration_report(session, judge)
+    context = {
+        "judge": judge,
+        "report": report,
+        "matrix": _matrix_view(report.agreement),
+    }
+    return templates.TemplateResponse(request, "calibration_detail.html", context)

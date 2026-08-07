@@ -31,11 +31,11 @@ Replay tasks against agents and score the results with an LLM judge.
       trajectories automatically
 - [x] `agentverdict eval` CLI combining replay + judging into one end-to-end suite run
 
-## M3 — Calibration lab (next)
+## M3 — Calibration lab (in progress)
 
 Measure the judge against the humans before trusting it.
 
-- [ ] Judge-vs-human agreement report: Cohen's kappa and per-verdict confusion matrix over the
+- [x] Judge-vs-human agreement report: Cohen's kappa and per-verdict confusion matrix over the
       golden dataset
 - [ ] Position-bias analysis (does verdict flip when candidate order is swapped?)
 - [ ] Verbosity-bias analysis (does the judge favor longer outputs at equal quality?)

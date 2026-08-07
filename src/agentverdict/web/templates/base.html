@@ -27,6 +27,12 @@
     }
     .topbar .brand { font-weight: 700; font-size: 1.05rem; color: #1f2733; }
     .topbar .tagline { color: #6b7686; font-size: 0.85rem; }
+    .topbar nav {
+      margin-left: auto;
+      display: flex;
+      gap: 1.1rem;
+      font-size: 0.9rem;
+    }
     main { max-width: 60rem; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
     h1 { font-size: 1.4rem; margin: 0.5rem 0 1rem; }
     h2 { font-size: 1.05rem; margin: 2rem 0 0.75rem; }
@@ -248,12 +254,119 @@
       text-align: center;
       color: #6b7686;
     }
+    /* Calibration */
+    .stat-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin: 0.75rem 0 0;
+    }
+    .stat {
+      background: #ffffff;
+      border: 1px solid #e3e7ee;
+      border-radius: 8px;
+      padding: 0.6rem 0.9rem;
+      min-width: 9.5rem;
+      flex: 1 1 9.5rem;
+    }
+    .stat .name {
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: #6b7686;
+    }
+    .stat .value {
+      font-size: 1.35rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.3;
+    }
+    .stat .note { font-size: 0.78rem; color: #6b7686; }
+    .headline {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+    }
+    .headline .kappa {
+      font-size: 2.2rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.1;
+    }
+    .headline .headline-label {
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: #6b7686;
+    }
+    p.headline-ci { margin: 0.35rem 0 0; font-size: 0.88rem; }
+    .matrix-axis { margin-bottom: 0.6rem; font-size: 0.88rem; }
+    .matrix-wrap { overflow-x: auto; }
+    table.matrix {
+      border-collapse: collapse;
+      background: #ffffff;
+      border: 1px solid #e3e7ee;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    table.matrix th, table.matrix td {
+      padding: 0.5rem 0.95rem;
+      border-bottom: 1px solid #eef1f6;
+      font-size: 0.92rem;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    table.matrix thead th {
+      background: #f8f9fc;
+      color: #6b7686;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    table.matrix th.corner, table.matrix th.row-head { text-align: left; }
+    table.matrix td.diagonal { background: #e6f4ea; color: #1e7e34; font-weight: 700; }
+    table.matrix td.zero { color: #b6bdc9; }
+    table.matrix td.total { color: #6b7686; }
+    table.matrix tfoot th, table.matrix tfoot td {
+      background: #f8f9fc;
+      color: #6b7686;
+      border-bottom: none;
+    }
+    table.queue tr.drill-body td { border-bottom: none; padding-top: 0; }
+    table.queue tr.drill-head td { border-bottom: none; }
+    .drill-rationale {
+      margin: 0;
+      color: #444e5c;
+      font-size: 0.86rem;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+    }
+    .empty-state .label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: #6b7686;
+      margin: 1rem 0 0.3rem;
+    }
+    .empty-state p:first-child { margin-top: 0; }
+    ul.fix-list { margin: 0; padding-left: 1.2rem; }
+    ul.fix-list li { margin-bottom: 0.4rem; }
+    ul.fix-list li:last-child { margin-bottom: 0; }
   </style>
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="/label">AgentVerdict</a>
     <span class="tagline">golden-dataset labeling</span>
+    <nav>
+      <a href="/label">Queue</a>
+      <a href="/calibration">Calibration</a>
+    </nav>
   </header>
   <main>
     {% block content %}{% endblock %}

@@ -1,0 +1,335 @@
+{% extends "base.html" %}
+
+{% block title %}{{ report.judge_name }} calibration · AgentVerdict{% endblock %}
+
+{% block content %}
+<div class="page-nav">
+  <a href="/calibration">&larr; All judges</a>
+  <span class="muted">report generated {{ report.generated_at | fmt_dt }}</span>
+</div>
+
+<h1>{{ report.judge_name }}</h1>
+<p>
+  <span class="muted mono">{{ report.judge_model }}</span>
+  {% if report.task_key %}
+    <span class="muted">&middot; task filter <span class="mono">{{ report.task_key }}</span></span>
+  {% endif %}
+  {% if report.eval_run_id %}
+    <span class="muted">&middot; eval run <span class="mono">{{ report.eval_run_id }}</span></span>
+  {% endif %}
+</p>
+
+<h2>Coverage</h2>
+<div class="stat-grid">
+  <div class="stat">
+    <div class="name">Judged</div>
+    <div class="value">{{ report.judged_trajectories }}</div>
+    <div class="note">trajectories this judge scored</div>
+  </div>
+  <div class="stat">
+    <div class="name">Labeled</div>
+    <div class="value">{{ report.labeled_trajectories }}</div>
+    <div class="note">trajectories with a human label</div>
+  </div>
+  <div class="stat">
+    <div class="name">Compared</div>
+    <div class="value">{{ report.compared }}</div>
+    <div class="note">both, so the statistics use them</div>
+  </div>
+  <div class="stat">
+    <div class="name">Judge errors</div>
+    <div class="value">{{ report.judge_errors }}</div>
+    <div class="note">failed calls, excluded</div>
+  </div>
+  <div class="stat">
+    <div class="name">Human ties</div>
+    <div class="value">{{ report.ties_excluded }}</div>
+    <div class="note">no majority, excluded</div>
+  </div>
+</div>
+
+{% if report.compared %}
+<h2>Agreement with the human majority</h2>
+<div class="card">
+  <div class="headline">
+    <span class="kappa">{{ report.agreement.cohens_kappa | fmt_num }}</span>
+    <span class="headline-label">Cohen's kappa</span>
+    <span class="badge {{ report.agreement.cohens_kappa | kappa_badge }}">
+      {{- report.agreement.interpretation -}}
+    </span>
+  </div>
+  <p class="muted headline-ci">
+    {% if report.agreement.kappa_ci_low is not none and report.agreement.kappa_ci_high is not none %}
+      95% bootstrap interval
+      {{ report.agreement.kappa_ci_low | fmt_num }} to {{ report.agreement.kappa_ci_high | fmt_num }}
+      over {{ report.agreement.n }} resampled trajectories
+    {% else %}
+      No confidence interval: {{ report.agreement.n }} compared
+      trajector{{ 'y' if report.agreement.n == 1 else 'ies' }} is too small a sample to resample.
+    {% endif %}
+  </p>
+  <div class="stat-grid">
+    <div class="stat">
+      <div class="name">Raw agreement</div>
+      <div class="value">{{ report.agreement.observed_agreement | fmt_pct }}</div>
+      <div class="note">verdicts that matched exactly</div>
+    </div>
+    <div class="stat">
+      <div class="name">Weighted kappa</div>
+      <div class="value">{{ report.agreement.weighted_kappa | fmt_num }}</div>
+      <div class="note">ordinal: pass vs fail costs double</div>
+    </div>
+    <div class="stat">
+      <div class="name">Sample</div>
+      <div class="value">{{ report.agreement.n }}</div>
+      <div class="note">trajectories behind every figure</div>
+    </div>
+  </div>
+</div>
+
+<h2>Confusion matrix</h2>
+<p class="muted matrix-axis">
+  Rows are the human majority verdict, columns are what this judge said.
+  Shaded cells on the diagonal are agreements; everything else is a miss.
+</p>
+<div class="matrix-wrap">
+  <table class="matrix">
+    <thead>
+      <tr>
+        <th class="corner">human \ judge</th>
+        {% for label in matrix.labels %}
+          <th>{{ label }}</th>
+        {% endfor %}
+        <th>total</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in matrix.rows %}
+      <tr>
+        <th class="row-head"><span class="badge verdict-{{ row.human }}">{{ row.human }}</span></th>
+        {% for cell in row.cells %}
+          <td{% if cell.classes %} class="{{ cell.classes }}"{% endif %}
+             title="humans said {{ row.human }}, judge said {{ cell.judge }}">{{ cell.count }}</td>
+        {% endfor %}
+        <td class="total">{{ row.total }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <th class="row-head">total</th>
+        {% for column in matrix.column_totals %}
+          <td>{{ column.count }}</td>
+        {% endfor %}
+        <td class="total">{{ matrix.total }}</td>
+      </tr>
+    </tfoot>
+  </table>
+</div>
+
+<h2>Per-verdict breakdown</h2>
+<p class="muted">
+  The human majority is treated as truth: precision is how often the judge is right when it says
+  a verdict, recall is how much of that human verdict it catches.
+</p>
+<table class="queue">
+  <thead>
+    <tr>
+      <th>Verdict</th>
+      <th>Human support</th>
+      <th>Judge predicted</th>
+      <th>Precision</th>
+      <th>Recall</th>
+      <th>F1</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for metric in report.agreement.per_class %}
+    <tr>
+      <td><span class="badge verdict-{{ metric.label }}">{{ metric.label }}</span></td>
+      <td class="num">{{ metric.support }}</td>
+      <td class="num">{{ metric.predicted }}</td>
+      <td class="num">{{ metric.precision | fmt_num }}</td>
+      <td class="num">{{ metric.recall | fmt_num }}</td>
+      <td class="num">{{ metric.f1 | fmt_num }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<h2>Nothing to compare yet</h2>
+<div class="card empty-state">
+  <p>
+    {% if report.judged_trajectories == 0 and report.labeled_trajectories == 0 %}
+      No trajectory carries a human label, and this judge has not scored anything. Every
+      agreement statistic is undefined until both exist for the same trajectory.
+    {% elif report.judged_trajectories == 0 %}
+      {{ report.labeled_trajectories }} trajector{{ 'y is' if report.labeled_trajectories == 1 else 'ies are' }}
+      labeled, but this judge has not scored any of them yet.
+    {% elif report.labeled_trajectories == 0 %}
+      This judge scored {{ report.judged_trajectories }}
+      trajector{{ 'y' if report.judged_trajectories == 1 else 'ies' }}, but none of them carry a
+      human label to compare against.
+    {% else %}
+      The judged set and the labeled set do not overlap on a usable trajectory. Judge the
+      trajectories that are already labeled, or label the ones that were judged.
+    {% endif %}
+  </p>
+  {% if report.judge_errors or report.ties_excluded %}
+  <p class="muted">
+    Excluded from the comparison:
+    {%- if report.judge_errors %}
+      {{ report.judge_errors }} errored judge call{{ '' if report.judge_errors == 1 else 's' }}
+      {{- ' and' if report.ties_excluded }}
+    {%- endif %}
+    {%- if report.ties_excluded %}
+      {{ report.ties_excluded }}
+      labeled trajector{{ 'y' if report.ties_excluded == 1 else 'ies' }} with no human majority
+    {%- endif -%}
+    .
+  </p>
+  {% endif %}
+  <p class="label">What fixes it</p>
+  <ul class="fix-list">
+    <li>
+      <code>agentverdict serve</code> then label trajectories at <a href="/label">/label</a>
+      &mdash; humans first, so the judge is measured against an independent opinion.
+    </li>
+    <li>
+      <code>agentverdict judge run {{ report.judge_name }}</code> scores stored trajectories with
+      this judge; <code>agentverdict eval --judge {{ report.judge_name }}</code> replays fresh ones
+      and judges them in one pass.
+    </li>
+    <li>
+      Then re-open this page, or run
+      <code>agentverdict calibrate {{ report.judge_name }}</code> for the same report in a terminal.
+    </li>
+  </ul>
+</div>
+{% endif %}
+
+<h2>Human agreement</h2>
+<p class="muted">
+  Context for the judge's kappa: nobody, human or model, reaches 1.00 on a real rubric.
+</p>
+
+{% if report.human_baseline %}
+<h3>Each annotator against the majority of the others</h3>
+<p class="muted">
+  The like-for-like comparison. The judge is scored against the aggregated human majority, and a
+  majority cancels out individual noise — so holding one annotator out and scoring them the same
+  way is the only number that sits on the same footing as the judge's.
+</p>
+<table class="queue">
+  <thead>
+    <tr>
+      <th>Annotator</th>
+      <th>Items</th>
+      <th>Raw agreement</th>
+      <th>Cohen's kappa</th>
+      <th>Reading</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in report.human_baseline %}
+    <tr>
+      <td>{{ row.annotator }}</td>
+      <td class="num">{{ row.n }}</td>
+      <td class="num">{{ row.observed_agreement | fmt_pct }}</td>
+      <td class="num">{{ row.cohens_kappa | fmt_num }}</td>
+      <td class="muted">{{ row.cohens_kappa | kappa_word }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if report.human_ceiling %}
+<h3>Annotator against annotator</h3>
+<p class="muted">
+  How two people compare directly, on the trajectories they both labeled. Useful for spotting a
+  grader who reads the rubric differently — but do not read the judge against it: comparing one
+  noisy rater to another sets a lower bar than comparing the judge to a de-noised majority, so a
+  judge of merely average quality will beat these numbers and look better than it is.
+</p>
+<table class="queue">
+  <thead>
+    <tr>
+      <th>Annotator</th>
+      <th>Annotator</th>
+      <th>Overlap</th>
+      <th>Raw agreement</th>
+      <th>Cohen's kappa</th>
+      <th>Reading</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for pair in report.human_ceiling %}
+    <tr>
+      <td>{{ pair.annotator_a }}</td>
+      <td>{{ pair.annotator_b }}</td>
+      <td class="num">{{ pair.n }}</td>
+      <td class="num">{{ pair.observed_agreement | fmt_pct }}</td>
+      <td class="num">{{ pair.cohens_kappa | fmt_num }}</td>
+      <td class="muted">{{ pair.cohens_kappa | kappa_word }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if not report.human_ceiling and not report.human_baseline %}
+<p class="muted">
+  No two annotators have labeled the same trajectory, so there is nothing to read the judge's
+  kappa against. Ask a second person to label trajectories someone else already labeled.
+</p>
+{% endif %}
+
+{% if report.compared %}
+<h2>Disagreements ({{ matrix.mismatched }})</h2>
+{% if report.disagreements %}
+<p class="muted">
+  Worst first by ordinal distance &mdash; a pass called a fail before a pass called borderline.
+  Open a trajectory to see exactly what the judge saw.
+  {% if matrix.mismatched > report.disagreements | length %}
+    Showing the worst {{ report.disagreements | length }}.
+  {% endif %}
+</p>
+<table class="queue drill">
+  <thead>
+    <tr>
+      <th>Task</th>
+      <th>Human</th>
+      <th>Judge</th>
+      <th>Distance</th>
+      <th>Annotators</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in report.disagreements %}
+    <tr class="drill-head">
+      <td><a href="/label/{{ row.trajectory_id }}">{{ row.task_key }}</a></td>
+      <td><span class="badge verdict-{{ row.human_verdict }}">{{ row.human_verdict }}</span></td>
+      <td><span class="badge verdict-{{ row.judge_verdict }}">{{ row.judge_verdict }}</span></td>
+      <td class="num">
+        {{ row.distance }}
+        {% if row.distance > 1 %}<span class="badge verdict-fail">opposite</span>{% endif %}
+      </td>
+      <td class="muted">{{ row.annotators | join(', ') }}</td>
+    </tr>
+    {% if row.judge_rationale %}
+    <tr class="drill-body">
+      <td colspan="5"><p class="drill-rationale">{{ row.judge_rationale }}</p></td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">
+  None &mdash; this judge matched the human majority on all {{ report.compared }} compared
+  trajectories.
+</p>
+{% endif %}
+{% endif %}
+{% endblock %}
