@@ -547,6 +547,7 @@ def test_human_ceiling_scores_overlapping_pairs_only(
     make_judge: Callable[..., Judge],
     make_trajectory: Callable[..., Trajectory],
     make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
 ) -> None:
     judge = make_judge()
     first = make_trajectory()
@@ -561,6 +562,10 @@ def test_human_ceiling_scores_overlapping_pairs_only(
     for trajectory, verdict in [(first, "pass"), (second, "fail")]:
         make_label(trajectory, "dave", verdict)
     make_label(isolated, "carol", "pass")  # overlaps nobody
+    # The ceiling is scoped to trajectories the judge actually scored, so that the
+    # human rows and the per-rater judge rows describe one item set.
+    for trajectory in (first, second, third, isolated):
+        make_verdict(judge, trajectory, "pass")
 
     report = build_calibration_report(session, judge)
 

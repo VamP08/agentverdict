@@ -6,7 +6,7 @@ human labels, so the endpoint never calls a model and needs no API key.
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -44,12 +44,24 @@ def get_judge_calibration(
     session: SessionDep,
     eval_run_id: str | None = None,
     task_key: str | None = None,
+    annotator: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "Restrict human labels to these annotators; repeat the parameter for each "
+                "one. Omit to use every annotator. Scoping a report to one annotation round "
+                "keeps rounds from being averaged together."
+            )
+        ),
+    ] = None,
 ) -> CalibrationReport:
     """Score a judge against the human-labeled golden set.
 
-    Optionally scoped to a single eval run and/or a single task key. An unknown
-    eval run is a 404 rather than an empty report: silently reporting zero
-    comparisons would read as a judge with nothing to answer for.
+    Optionally scoped to a single eval run, a single task key, and/or a named set
+    of annotators. An unknown eval run is a 404 rather than an empty report:
+    silently reporting zero comparisons would read as a judge with nothing to
+    answer for. An unknown annotator is not an error — it simply contributes no
+    labels, which the report's coverage counts make visible.
     """
     judge = _get_judge_or_404(judge_id, session)
     if eval_run_id is not None:
@@ -61,7 +73,13 @@ def get_judge_calibration(
                 status_code=404,
                 detail=f"Eval run {eval_run_id!r} does not belong to judge {judge.name!r}",
             )
-    return build_calibration_report(session, judge, eval_run_id=eval_run_id, task_key=task_key)
+    return build_calibration_report(
+        session,
+        judge,
+        eval_run_id=eval_run_id,
+        task_key=task_key,
+        annotators=annotator,
+    )
 
 
 @router.get("/trajectories/{trajectory_id}/verdicts", response_model=list[JudgeVerdictRead])

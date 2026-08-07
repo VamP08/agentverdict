@@ -58,9 +58,10 @@ from the accumulated judgments, and the calibrated judge gates pull requests in 
 - End-to-end `agentverdict eval`: replay a slice of the task set, judge exactly the runs it
   just produced, and print one combined summary
 - Judge calibration: Cohen's kappa against the human labels, an ordinal weighted kappa, a
-  bootstrap confidence interval, the confusion matrix, the inter-annotator human ceiling, and a
-  ranked drill-down of every disagreement — on the CLI, over the API, and as a `/calibration`
-  page in the browser
+  bootstrap confidence interval, the confusion matrix, the inter-annotator human ceiling, a
+  per-annotator comparison that puts judge and humans on identical items, and a ranked
+  drill-down of every disagreement — on the CLI, over the API, and as a `/calibration` page in
+  the browser
 - CLI: `init-db`, `import`, `export`, `stats`, `serve`, `judge`, `replay`, `eval`, `calibrate`
 - REST API under `/api`, test suite, CI workflow, docker-compose for Postgres
 
@@ -287,9 +288,59 @@ just the other person.
 A low human baseline is the cheapest early warning that a rubric is underspecified: it means
 your own definition of `pass` is not shared, and every number downstream inherits that noise.
 
-Scope a report to one batch with `--eval-run` or to one slice of the task set with `--task-key`,
-and pass `--json` to get the whole report as a single JSON object — what a CI job or a notebook
-should read, instead of parsing the printed tables. The same figures live in the browser UI:
+### Judge against each annotator, on the same items
+
+The headline kappa is measured against the human **majority**, and a trajectory whose annotators
+tie has no majority, so it is dropped from the comparison. With two annotators every
+disagreement is a tie — which means the judge is scored only on the trajectories the humans
+already agreed about, the easy ones, while the human figures beside it are computed over
+everything the judge scored, hard cases included. Two numbers over two different samples, printed
+side by side as if they were commensurable.
+
+This is not hypothetical; it happened on this project's own dataset. The report showed a judge
+kappa of **0.786** against a human "ceiling" of **0.523**, which reads as a judge comfortably
+outscoring the annotators it is supposed to imitate. Recomputed on the identical 13 trajectories,
+the picture inverts:
+
+- vamp vs momo — kappa 0.523
+- vamp vs judge — kappa 0.337
+- momo vs judge — kappa 0.764
+
+The judge agrees with one of its two annotators *less* than the annotators agree with each other.
+The 0.786 was not a better judge, it was an easier sample.
+
+So the report also scores the judge against **each annotator individually, on exactly the
+trajectories both of them rated** — ties included, nothing dropped for want of a majority. Those
+rows carry the same `n` as the pairwise human rows beside them, so judge-vs-human and
+human-vs-human can be read against each other directly instead of hoping the two samples happen
+to match. The headline kappa stays where it is, because the aggregated majority is still the
+right ground truth to hold a judge to; it is just no longer the only number on the page, and no
+longer the one that can quietly flatter.
+
+### Scoping a report to one annotation round
+
+`--annotator` restricts a report to a named set of raters. Repeat the flag once per name:
+
+```bash
+agentverdict calibrate groq-70b --annotator vamp-r2 --annotator momo-r2
+```
+
+Everything is then computed from those annotators' labels alone — the majority verdict the judge
+is scored against, the ties, the human ceiling and baseline, and the per-annotator rows.
+
+The reason it exists: when a disagreement turns out to be an ambiguous rubric rather than a
+grading mistake, the fix is to write the rule down (the rubric rules in [DESIGN.md](DESIGN.md))
+and label again. But a label is unique per (trajectory, annotator) and re-submitting replaces the
+old one, so re-labeling under the same names would erase the evidence that the rubric was ever
+ambiguous. The second round is therefore recorded under fresh names — `vamp-r2`, `momo-r2` — and
+`--annotator` picks which round a report describes. Round 1 stays on disk as the honest
+pre-clarification record, and the two rounds can be scored against each other rather than one
+silently overwriting the other.
+
+Scope a report to one batch with `--eval-run` or to one slice of the task set with `--task-key`;
+all three filters compose, so one round on one task's trajectories is a single command. Pass
+`--json` to get the whole report as a single JSON object — what a CI job or a notebook should
+read, instead of parsing the printed tables. The same figures live in the browser UI:
 <http://127.0.0.1:8000/calibration> lists the judges with their kappa, and
 `/calibration/{judge_id}` shows the matrix, the human ceiling, and the drill-down, with each
 disagreement linking straight through to the trajectory.

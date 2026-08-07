@@ -37,6 +37,9 @@ Measure the judge against the humans before trusting it.
 
 - [x] Judge-vs-human agreement report: Cohen's kappa and per-verdict confusion matrix over the
       golden dataset
+- [x] Per-annotator comparison (the judge scored against each rater on exactly the items both
+      rated, so judge and human numbers sit on the same sample) and `--annotator` scoping, so a
+      re-labeled round is reported on its own while the first round is kept as-is
 - [ ] Position-bias analysis (does verdict flip when candidate order is swapped?)
 - [ ] Verbosity-bias analysis (does the judge favor longer outputs at equal quality?)
 - [ ] Self-preference analysis (does the judge favor outputs from its own model family?)

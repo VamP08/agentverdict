@@ -63,9 +63,13 @@
       95% bootstrap interval
       {{ report.agreement.kappa_ci_low | fmt_num }} to {{ report.agreement.kappa_ci_high | fmt_num }}
       over {{ report.agreement.n }} resampled trajectories
-    {% else %}
+    {% elif report.agreement.n < 2 %}
       No confidence interval: {{ report.agreement.n }} compared
       trajector{{ 'y' if report.agreement.n == 1 else 'ies' }} is too small a sample to resample.
+    {% else %}
+      No confidence interval: only {{ report.agreement.bootstrap_usable }} of
+      {{ report.agreement.bootstrap_iterations }} resamples produced a defined kappa. The
+      verdicts are too lopsided to resample, which is itself the finding.
     {% endif %}
   </p>
   <div class="stat-grid">
@@ -206,6 +210,39 @@
     </li>
   </ul>
 </div>
+{% endif %}
+
+{% if report.judge_vs_annotator %}
+<h2>Judge against each annotator</h2>
+<p class="muted">
+  Each row is scored on exactly the trajectories that annotator and the judge both rated, so these
+  numbers share an item set with the human ones below and the two can be read against each other.
+  The headline kappa cannot be: it is measured against the human <em>majority</em>, which drops
+  every trajectory where the annotators tied &mdash; with two annotators that is every
+  disagreement. A higher headline can therefore mean an easier sample rather than a better judge.
+</p>
+<table class="queue">
+  <thead>
+    <tr>
+      <th>Annotator</th>
+      <th>Items</th>
+      <th>Raw agreement</th>
+      <th>Cohen's kappa</th>
+      <th>Reading</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in report.judge_vs_annotator %}
+    <tr>
+      <td>{{ row.annotator }}</td>
+      <td class="num">{{ row.n }}</td>
+      <td class="num">{{ row.observed_agreement | fmt_pct }}</td>
+      <td class="num">{{ row.cohens_kappa | fmt_num }}</td>
+      <td class="muted">{{ row.cohens_kappa | kappa_word }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
 {% endif %}
 
 <h2>Human agreement</h2>

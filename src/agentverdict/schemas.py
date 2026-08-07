@@ -200,7 +200,22 @@ class AgreementRead(BaseModel):
     bootstrap_iterations: int = 0
 
 
-class AnnotatorPairAgreement(BaseModel):
+class PairUncertainty(BaseModel):
+    """Bootstrap uncertainty for a secondary agreement row.
+
+    These rows are often computed over a handful of items, and the report tells
+    readers to prefer them over the headline — so they carry the same interval and
+    the same discard count. A bare kappa of 1.000 over three trajectories, shown
+    without either, is exactly the overclaiming this project exists to catch.
+    """
+
+    kappa_ci_low: float | None = None
+    kappa_ci_high: float | None = None
+    bootstrap_usable: int = 0
+    bootstrap_iterations: int = 0
+
+
+class AnnotatorPairAgreement(PairUncertainty):
     """Agreement between two individual humans, on the items both labeled."""
 
     annotator_a: str
@@ -210,7 +225,24 @@ class AnnotatorPairAgreement(BaseModel):
     cohens_kappa: float | None = None
 
 
-class HeldOutAnnotatorAgreement(BaseModel):
+class JudgeAnnotatorAgreement(PairUncertainty):
+    """The judge against one annotator, on exactly the items both of them rated.
+
+    The headline kappa is computed against the human *majority*, which silently
+    drops trajectories where the annotators tied — so with two annotators the judge
+    is scored only on the items they agreed about, an easier set than the one the
+    annotators are scored on. That makes the headline number and the human figures
+    non-comparable. These rows put every rater on the same items so the three
+    numbers can honestly sit side by side.
+    """
+
+    annotator: str
+    n: int
+    observed_agreement: float | None = None
+    cohens_kappa: float | None = None
+
+
+class HeldOutAnnotatorAgreement(PairUncertainty):
     """One human scored the same way the judge is: against a majority of others.
 
     The judge is compared against the aggregated human majority, which is quieter
@@ -245,7 +277,14 @@ class CalibrationReport(BaseModel):
     judge_model: str
     eval_run_id: str | None = None
     task_key: str | None = None
+    annotators: list[str] = Field(default_factory=list)  # scope filter, empty = all
     generated_at: datetime
+
+    # Annotators who actually contributed an in-scope label. A scope naming two
+    # people where only one has labels still collapses the panel to one rater, so
+    # this — not len(annotators) — is what tells a reader a "majority" is really
+    # a single opinion.
+    annotators_present: list[str] = Field(default_factory=list)
 
     judged_trajectories: int = 0  # trajectories this judge produced a verdict for
     labeled_trajectories: int = 0  # trajectories carrying at least one human label
@@ -254,6 +293,7 @@ class CalibrationReport(BaseModel):
     ties_excluded: int = 0  # labeled trajectories with no human majority
 
     agreement: AgreementRead
+    judge_vs_annotator: list[JudgeAnnotatorAgreement] = Field(default_factory=list)
     human_ceiling: list[AnnotatorPairAgreement] = Field(default_factory=list)
     human_baseline: list[HeldOutAnnotatorAgreement] = Field(default_factory=list)
     disagreements: list[DisagreementRow] = Field(default_factory=list)

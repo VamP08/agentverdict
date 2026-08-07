@@ -5,10 +5,23 @@ evidence. This module answers one question over rows already in the database:
 when the judge scored a trajectory the humans also scored, how often — and how
 badly — did it disagree with them?
 
-The report has three parts, each answering a different follow-up:
+The report has four parts, each answering a different follow-up:
 
 * **agreement** — the confusion matrix, raw agreement, Cohen's kappa with a
   bootstrap interval, and an ordinal weighted kappa. This is the headline.
+* **judge vs. each annotator** — the judge scored against one human at a time, on
+  exactly the trajectories both of them rated. This exists because the headline is
+  computed against the human *majority*, and a majority does not exist when the
+  annotators tie, so those trajectories are silently dropped from the comparison.
+  With two annotators *every* disagreement is a tie: the judge ends up scored only
+  on the items the humans found easy, while the human figures below are computed
+  over everything the judge touched. Two statistics measured on different samples
+  cannot be read against each other, and this project's own data shows how far
+  that misleads — a headline kappa of 0.786 against a human ceiling of 0.523 read
+  as a judge beating its annotators, when on the identical 13 items the judge
+  scored 0.337 against one of them and 0.764 against the other, either side of a
+  human-vs-human 0.523. The per-rater rows hold every rater to the same items, so
+  the numbers printed next to each other actually describe the same thing.
 * **human ceiling** — chance-corrected agreement between each pair of human
   annotators on the trajectories they both labeled. This is the part that makes
   the headline readable. Verdicts on real agent trajectories are genuinely
@@ -21,6 +34,13 @@ The report has three parts, each answering a different follow-up:
   pass/borderline one) and carrying the judge's own rationale, so the failure
   mode can be read rather than guessed at. This is the actionable output.
 
+A report can also be scoped to a named set of annotators. Once a rubric ambiguity
+is written down, a second annotation round measures a *different* thing than the
+first, so overwriting the original labels would destroy the evidence that the
+ambiguity mattered. Recording the re-labels under distinct annotator names and
+scoping the report to them keeps each round independently readable, with round one
+preserved as the honest pre-clarification record.
+
 Everything here is pure analysis over stored verdicts and labels: no model is
 called, no API key is needed, and running it costs nothing, which is what makes
 it safe to put in a CI gate.
@@ -32,6 +52,7 @@ from collections import Counter, defaultdict
 from collections.abc import Container, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -40,6 +61,7 @@ from agentverdict.calibration.stats import (
     VERDICT_ORDER,
     AgreementStats,
     agreement_stats,
+    bootstrap_kappa,
     cohens_kappa,
     observed_agreement,
 )
@@ -51,6 +73,7 @@ from agentverdict.schemas import (
     ClassMetricsRead,
     DisagreementRow,
     HeldOutAnnotatorAgreement,
+    JudgeAnnotatorAgreement,
 )
 
 #: Position of each verdict on the ordinal scale, for distance arithmetic.
@@ -173,9 +196,19 @@ def _latest_judge_calls(
 
 
 def _labels_by_trajectory(
-    session: Session, *, task_key: str | None
+    session: Session, *, task_key: str | None, annotators: Sequence[str] | None = None
 ) -> dict[str, list[HumanLabel]]:
-    """Every human label in scope, grouped by trajectory in one query."""
+    """Every human label in scope, grouped by trajectory in one query.
+
+    ``annotators``, when given, restricts the whole report to one named panel — the
+    filter is applied here, at the single point every downstream statistic reads
+    from, so the majority, the ties, the ceiling, the baseline and the per-rater
+    rows can never disagree about who was in scope. A name nobody labeled under
+    simply contributes nothing; it is not an error, because asking for a round that
+    has not been annotated yet should report an empty comparison rather than raise.
+    Trajectories left with no in-scope label drop out of the mapping entirely, which
+    is what keeps ``labeled_trajectories`` honest under scoping.
+    """
     stmt = (
         select(HumanLabel)
         .join(Trajectory, HumanLabel.trajectory_id == Trajectory.id)
@@ -184,6 +217,8 @@ def _labels_by_trajectory(
     )
     if task_key is not None:
         stmt = stmt.where(Task.key == task_key)
+    if annotators is not None:
+        stmt = stmt.where(HumanLabel.annotator.in_(annotators))
 
     grouped: dict[str, list[HumanLabel]] = defaultdict(list)
     for label in session.scalars(stmt):
@@ -191,17 +226,99 @@ def _labels_by_trajectory(
     return dict(grouped)
 
 
+def _judge_vs_annotator(
+    labels_by_trajectory: Mapping[str, list[HumanLabel]],
+    judge_calls: Mapping[str, _JudgeCall],
+    *,
+    iterations: int,
+    seed: int,
+) -> list[JudgeAnnotatorAgreement]:
+    """Score the judge against each annotator individually, on their shared items.
+
+    Deliberately *not* against the majority. A majority is undefined when the
+    annotators tie, so the headline comparison quietly drops exactly those
+    trajectories — and with two annotators a tie is what every disagreement looks
+    like. The headline is therefore computed on the subset the humans agreed
+    about, while the ceiling and baseline below it are computed on everything
+    judged: the judge is being graded on an easier sample than the humans, which
+    is how a merely-average judge comes to look superhuman.
+
+    Pairing one annotator's verdict directly with the judge's on the trajectories
+    both of them rated removes that asymmetry. The judge no longer benefits from
+    the hard cases being dropped, and its number lands on the same items — and so
+    the same difficulty — as the human-vs-human number it is read against.
+
+    Reads only the two in-memory mappings the caller already fetched, so it adds
+    no queries. Annotators sharing no trajectory with the judge are skipped
+    (nothing to compare); widest overlap first, as the sturdiest estimate.
+    """
+    pairs_by_annotator: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for trajectory_id in sorted(labels_by_trajectory):
+        call = judge_calls.get(trajectory_id)
+        if call is None or call.verdict not in _VERDICT_INDEX:
+            continue
+        for label in labels_by_trajectory[trajectory_id]:
+            if label.verdict in _VERDICT_INDEX:
+                # Human first: the annotator is the reference rater, as everywhere else.
+                pairs_by_annotator[label.annotator].append((label.verdict, call.verdict))
+
+    rows = [
+        JudgeAnnotatorAgreement(
+            annotator=annotator,
+            **_pair_fields(pairs, iterations=iterations, seed=seed),
+        )
+        for annotator, pairs in sorted(pairs_by_annotator.items())
+        if pairs
+    ]
+    rows.sort(key=lambda row: (-row.n, row.annotator))
+    return rows
+
+
+def _pair_fields(
+    pairs: Sequence[tuple[str, str]], *, iterations: int, seed: int
+) -> dict[str, Any]:
+    """The statistics every secondary agreement row carries, uncertainty included.
+
+    These rows are frequently built from a handful of trajectories, and the report
+    directs readers to prefer them over the headline — so they get the same
+    bootstrap treatment. Without it a row reading "n=3 kappa 1.000" would be
+    rendered as "almost perfect" with nothing to signal how little is behind it.
+    """
+    result = bootstrap_kappa(pairs, VERDICT_ORDER, iterations=iterations, seed=seed)
+    low, high = result.interval if result.interval is not None else (None, None)
+    return {
+        "n": len(pairs),
+        "observed_agreement": observed_agreement(pairs, VERDICT_ORDER),
+        "cohens_kappa": cohens_kappa(pairs, VERDICT_ORDER),
+        "kappa_ci_low": low,
+        "kappa_ci_high": high,
+        "bootstrap_usable": result.usable,
+        "bootstrap_iterations": result.iterations,
+    }
+
+
 def _human_ceiling(
     labels_by_trajectory: Mapping[str, list[HumanLabel]],
+    scope: Container[str],
+    *,
+    iterations: int,
+    seed: int,
 ) -> list[AnnotatorPairAgreement]:
-    """Pairwise inter-annotator agreement — the bar the judge is read against.
+    """Pairwise inter-annotator agreement, for spotting a divergent grader.
 
     Every unordered pair of annotators is scored on exactly the trajectories both
     of them labeled; pairs with no overlap are skipped because there is nothing
     to compare. Widest overlap first, since that is the most trustworthy estimate.
+
+    Restricted to ``scope`` — the trajectories the judge produced a verdict for —
+    for the same reason ``_human_baseline`` is: the report states that the human
+    rows and the per-rater judge rows describe one item set, and that claim is
+    false the moment the judge has not scored every labeled trajectory.
     """
     by_annotator: dict[str, dict[str, str]] = defaultdict(dict)
     for trajectory_id, labels in labels_by_trajectory.items():
+        if trajectory_id not in scope:
+            continue
         for label in labels:
             if label.verdict in _VERDICT_INDEX:
                 by_annotator[label.annotator][trajectory_id] = label.verdict
@@ -217,9 +334,7 @@ def _human_ceiling(
             AnnotatorPairAgreement(
                 annotator_a=annotator_a,
                 annotator_b=annotator_b,
-                n=len(pairs),
-                observed_agreement=observed_agreement(pairs, VERDICT_ORDER),
-                cohens_kappa=cohens_kappa(pairs, VERDICT_ORDER),
+                **_pair_fields(pairs, iterations=iterations, seed=seed),
             )
         )
     rows.sort(key=lambda row: (-row.n, row.annotator_a, row.annotator_b))
@@ -229,6 +344,9 @@ def _human_ceiling(
 def _human_baseline(
     labels_by_trajectory: Mapping[str, list[HumanLabel]],
     scope: Container[str],
+    *,
+    iterations: int,
+    seed: int,
 ) -> list[HeldOutAnnotatorAgreement]:
     """Score each annotator the way the judge is scored: against a majority of others.
 
@@ -271,9 +389,7 @@ def _human_baseline(
         rows.append(
             HeldOutAnnotatorAgreement(
                 annotator=annotator,
-                n=len(pairs),
-                observed_agreement=observed_agreement(pairs, VERDICT_ORDER),
-                cohens_kappa=cohens_kappa(pairs, VERDICT_ORDER),
+                **_pair_fields(pairs, iterations=iterations, seed=seed),
             )
         )
     rows.sort(key=lambda row: (-row.n, row.annotator))
@@ -286,6 +402,7 @@ def build_calibration_report(
     *,
     eval_run_id: str | None = None,
     task_key: str | None = None,
+    annotators: Sequence[str] | None = None,
     max_disagreements: int = 25,
     bootstrap_iterations: int = 1000,
     seed: int = 0,
@@ -298,14 +415,24 @@ def build_calibration_report(
         eval_run_id: Restrict the judge's verdicts to a single eval run. Human
             labels are unaffected — they belong to the dataset, not to a run.
         task_key: Restrict the whole report to one task's trajectories.
+        annotators: Consider only labels from these annotators, everywhere — the
+            majority, the tie count, the ceiling, the baseline, the per-rater
+            rows, and ``labeled_trajectories``. This is how a second annotation
+            round, recorded under its own names, gets scored on its own. Names
+            nobody labeled under yield an empty comparison rather than an error.
+            ``None`` — or an empty sequence, which no caller can have meant as
+            "score nobody" — means every annotator.
         max_disagreements: Cap on the drill-down list, worst cases kept.
         bootstrap_iterations: Resamples behind the kappa confidence interval.
         seed: Bootstrap seed, so the same data always yields the same interval.
     """
+    scoped_annotators = sorted(set(annotators)) if annotators else []
     judge_calls, judge_errors = _latest_judge_calls(
         session, judge, eval_run_id=eval_run_id, task_key=task_key
     )
-    labels_by_trajectory = _labels_by_trajectory(session, task_key=task_key)
+    labels_by_trajectory = _labels_by_trajectory(
+        session, task_key=task_key, annotators=scoped_annotators or None
+    )
 
     ties_excluded = 0
     majorities: dict[str, str] = {}
@@ -369,6 +496,17 @@ def build_calibration_report(
         judge_model=judge.model,
         eval_run_id=eval_run_id,
         task_key=task_key,
+        annotators=scoped_annotators,
+        # Who actually contributed a label, which is what decides whether the
+        # "majority" this report speaks of is a panel or one person's opinion.
+        annotators_present=sorted(
+            {
+                label.annotator
+                for labels in labels_by_trajectory.values()
+                for label in labels
+                if label.verdict in _VERDICT_INDEX
+            }
+        ),
         generated_at=utcnow(),
         judged_trajectories=len(judge_calls),
         labeled_trajectories=len(labels_by_trajectory),
@@ -376,8 +514,21 @@ def build_calibration_report(
         judge_errors=judge_errors,
         ties_excluded=ties_excluded,
         agreement=_to_agreement_read(stats),
-        human_ceiling=_human_ceiling(labels_by_trajectory),
-        human_baseline=_human_baseline(labels_by_trajectory, judge_calls.keys()),
+        judge_vs_annotator=_judge_vs_annotator(
+            labels_by_trajectory, judge_calls, iterations=bootstrap_iterations, seed=seed
+        ),
+        human_ceiling=_human_ceiling(
+            labels_by_trajectory,
+            judge_calls.keys(),
+            iterations=bootstrap_iterations,
+            seed=seed,
+        ),
+        human_baseline=_human_baseline(
+            labels_by_trajectory,
+            judge_calls.keys(),
+            iterations=bootstrap_iterations,
+            seed=seed,
+        ),
         disagreements=disagreements[: max(max_disagreements, 0)],
         disagreements_total=len(disagreements),
     )

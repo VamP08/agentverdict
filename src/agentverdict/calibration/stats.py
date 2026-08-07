@@ -259,8 +259,14 @@ def per_class_metrics(
         predicted = sum(matrix[row][label] for row in labels)
         precision = hits / predicted if predicted else None
         recall = hits / support if support else None
-        if precision is None or recall is None or precision + recall == 0:
+        if precision is None or recall is None:
             f1 = None
+        elif precision + recall == 0:
+            # Predicted this label and never got it right, with real support to
+            # miss: F1 is a defined 0.0, not an absent statistic. Returning None
+            # here would print "n/a" — the same marker as "no data" — for the
+            # single worst result in the table.
+            f1 = 0.0
         else:
             f1 = 2 * precision * recall / (precision + recall)
         metrics.append(

@@ -213,6 +213,11 @@ def _calibration_scope(report: CalibrationReport) -> str:
         parts.append(f"eval run {report.eval_run_id[:8]}")
     if report.task_key:
         parts.append(f"task '{report.task_key}'")
+    # An annotator filter changes which labels count, so it belongs in the scope
+    # line: a second annotation round scored on its own must never be mistaken
+    # for the whole dataset.
+    if report.annotators:
+        parts.append(f"annotators {', '.join(report.annotators)}")
     return ", ".join(parts) if parts else "whole dataset (every run, every task)"
 
 
@@ -265,6 +270,35 @@ def _print_calibration_headline(agreement: AgreementRead) -> None:
     )
 
 
+def _print_judge_vs_annotator(report: CalibrationReport) -> None:
+    """Print the judge against each annotator on exactly the items both of them rated.
+
+    The headline above is scored against the human *majority*, which drops the
+    trajectories the annotators tied on — with two annotators that is every
+    disagreement, so the judge is graded on an easier sample than the humans are.
+    These rows put every rater on the same items, which is what makes the judge's
+    number and the human numbers comparable at all.
+    """
+    rows = report.judge_vs_annotator
+    if not rows:
+        return
+    typer.echo("Judge against each annotator (same items, like-for-like)")
+    stub = max(len(row.annotator) for row in rows)
+    count = max(len(str(row.n)) for row in rows)
+    for row in rows:
+        typer.echo(
+            f"  {row.annotator:<{stub}}   n={str(row.n).rjust(count)}"
+            f"  kappa {_fmt_stat(row.cohens_kappa):>6}"
+            f"  agreement {_fmt_pct(row.observed_agreement):>6}"
+        )
+    typer.echo("  These use the same trajectories as the human numbers below.")
+    if report.ties_excluded:
+        # Only claim the samples differ when trajectories were actually dropped.
+        dropped = _count(report.ties_excluded, "tied trajectory", "tied trajectories")
+        typer.echo(f"  The headline kappa above dropped {dropped}, so it")
+        typer.echo("  is measured on a different sample and is not comparable to these rows.")
+
+
 def _print_confusion_matrix(agreement: AgreementRead) -> None:
     """Render human-vs-judge counts as a small aligned table with row/column totals."""
     labels = _labels(agreement)
@@ -308,8 +342,16 @@ def _print_human_ceiling(report: CalibrationReport, *, reading_aid: bool = True)
     """Print how well the humans agree — the context the judge's kappa needs."""
     typer.echo("Human agreement")
     if not report.human_ceiling and not report.human_baseline:
-        typer.echo("  No two annotators have labeled the same trajectory, so there is nothing")
-        typer.echo("  to compare the judge against. Double-label a slice of the set to get it.")
+        if report.annotators:
+            # The filter removed the other raters, not the dataset. Telling the
+            # reader to double-label here would send them after a no-op.
+            named = ", ".join(report.annotators)
+            typer.echo(f"  Only labels from {named} count in this scope, so no second rater is")
+            typer.echo("  left to compare against. Drop --annotator, or name another annotator,")
+            typer.echo("  to read the judge against the human bar.")
+        else:
+            typer.echo("  No two annotators have labeled the same trajectory, so there is nothing")
+            typer.echo("  to compare the judge against. Double-label a slice of the set to get it.")
         return
 
     if report.human_baseline:
@@ -425,6 +467,13 @@ def _print_calibration_next_steps(report: CalibrationReport) -> None:
         typer.echo(
             "  This report is scoped to one eval run; drop --eval-run to compare against every run."
         )
+    if report.annotators:
+        # A mistyped annotator name looks exactly like an unlabeled dataset, so
+        # name the filter that is hiding the labels rather than leaving it implicit.
+        typer.echo(
+            f"  Only labels from {', '.join(report.annotators)} count here;"
+            " drop --annotator to use every annotator's labels."
+        )
 
 
 def _print_calibration_report(report: CalibrationReport) -> None:
@@ -442,6 +491,9 @@ def _print_calibration_report(report: CalibrationReport) -> None:
         return
     _print_calibration_headline(report.agreement)
     typer.echo("")
+    if report.judge_vs_annotator:
+        _print_judge_vs_annotator(report)
+        typer.echo("")
     _print_confusion_matrix(report.agreement)
     typer.echo("")
     _print_calibration_per_class(report.agreement)
@@ -707,6 +759,13 @@ def calibrate(
     task_key: Annotated[
         str | None, typer.Option("--task-key", help="Only compare trajectories of this task.")
     ] = None,
+    annotator: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--annotator",
+            help="Only count labels from this annotator; repeat to name a set (default: all).",
+        ),
+    ] = None,
     as_json: Annotated[
         bool, typer.Option("--json", help="Print the full report as JSON and nothing else.")
     ] = False,
@@ -724,6 +783,10 @@ def calibrate(
                 judge,
                 eval_run_id=eval_run,
                 task_key=task_key,
+                # `or None`: older Typer releases hand a repeatable option an empty
+                # list rather than None when it is absent, and "no names given"
+                # means every annotator, not nobody.
+                annotators=annotator or None,
                 # Uncapped: the text view trims for readability but reports the
                 # true total, and --json is documented to carry every row.
                 max_disagreements=sys.maxsize,

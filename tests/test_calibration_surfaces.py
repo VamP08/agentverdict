@@ -335,6 +335,9 @@ def test_calibration_detail_shows_the_human_ceiling(
     make_label(split, "alice", "pass")
     make_label(split, "bob", "fail")
     make_verdict(judge, agreed, "pass")
+    # The ceiling only covers trajectories the judge scored, so `split` has to be
+    # judged for the humans' disagreement on it to appear in the ceiling at all.
+    make_verdict(judge, split, "pass")
 
     html = client.get(f"/calibration/{judge.id}").text
 

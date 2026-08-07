@@ -307,7 +307,13 @@ def calibration_index(request: Request, session: SessionDep) -> Response:
 
 @router.get("/calibration/{judge_id}", response_class=HTMLResponse)
 def calibration_detail(request: Request, judge_id: str, session: SessionDep) -> Response:
-    """The full report for one judge: matrix, per-class metrics, ceiling, disagreements."""
+    """One judge in full: matrix, per-class metrics, per-rater rows, ceiling, disagreements.
+
+    The per-rater block is what keeps the page honest. The headline kappa is scored
+    against the human majority, which silently drops annotator ties, so it is not
+    computed on the same items as the human figures underneath it; the per-rater rows
+    put the judge and each annotator on one shared item set.
+    """
     judge = session.get(Judge, judge_id)
     if judge is None:
         raise HTTPException(
