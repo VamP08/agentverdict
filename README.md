@@ -44,17 +44,25 @@ from the accumulated judgments, and the calibrated judge gates pull requests in 
 
 ## Current status
 
-**Milestone 1 — golden-dataset workbench** (in progress). What works today:
+**Milestone 1 — golden-dataset workbench** and **Milestone 2 — eval runner** are done. What
+works today:
 
 - Trajectory store: tasks, multi-step trajectories, and human labels in SQLite or Postgres
 - JSONL import/export of trajectory bundles, with realistic sample data in `examples/`
 - Browser labeling UI: queue → trajectory view → submit verdict → next unlabeled
-- CLI: `init-db`, `import`, `export`, `stats`, `serve`
+- LLM-as-judge scoring via Groq: strict-JSON `pass|fail|borderline` verdicts with a rationale
+  and rubric scores, persisted per trajectory and shown beneath the human label form
+- Replay harness: a tool-calling reference agent works through stored tasks against
+  fixture-driven mock tools and records each attempt as a fresh trajectory — no live systems
+  to stub, no randomness, so a replay is reproducible
+- End-to-end `agentverdict eval`: replay a slice of the task set, judge exactly the runs it
+  just produced, and print one combined summary
+- CLI: `init-db`, `import`, `export`, `stats`, `serve`, `judge`, `replay`, `eval`
 - REST API under `/api`, test suite, CI workflow, docker-compose for Postgres
 
-No LLM calls happen anywhere in M1 — this milestone is entirely about building trustworthy
-ground truth. Eval running, judge calibration, distillation, and the CI gate are later
-milestones; see [ROADMAP.md](ROADMAP.md).
+The human-labeled dataset stays the ground truth throughout: the judge is scored against it,
+never the other way round. Judge calibration (kappa and bias analysis), the distilled local
+judge, and the CI gate are later milestones; see [ROADMAP.md](ROADMAP.md).
 
 ## Quickstart
 
@@ -98,14 +106,121 @@ agentverdict serve
 All configuration comes from `AGENTVERDICT_*` environment variables (or `.env`);
 `AGENTVERDICT_DATABASE_URL` selects the database.
 
+### Database migrations
+
+Schema changes ship as Alembic revisions inside the package
+(`src/agentverdict/migrations`), and `agentverdict init-db` applies them. It is the one
+command to run against a fresh or an existing database, on SQLite and Postgres alike. New
+revisions are written from the repo root:
+
+```bash
+alembic revision --autogenerate -m "add a column"
+```
+
+`alembic.ini` deliberately carries no database URL: the migration environment reads
+`AGENTVERDICT_DATABASE_URL` like everything else, so the CLI and manual `alembic` commands
+always target the same database.
+
+A database created before migrations existed has the tables but no revision stamp, so a plain
+upgrade would try to create tables that are already there. `init-db` handles that case itself:
+an untracked database is stamped at the baseline revision and then upgraded forward, so
+existing data survives and the columns added since arrive as ordinary migrations. There is
+nothing manual to run.
+
+## Running an evaluation
+
+Replay and judging are the only parts that call out to a model, so they need a Groq API key.
+A `.env` file in the working directory is read automatically, which is the least annoying
+option:
+
+```
+GROQ_API_KEY=gsk_...
+```
+
+Or set it in the shell for the session — bash/zsh:
+
+```bash
+export GROQ_API_KEY="gsk_..."
+```
+
+PowerShell:
+
+```powershell
+$env:GROQ_API_KEY = "gsk_..."
+```
+
+`AGENTVERDICT_GROQ_API_KEY` works too and wins if both are set. Then register a judge, replay a
+couple of tasks, and score the result:
+
+```bash
+agentverdict judge add groq-70b
+agentverdict replay --limit 2
+agentverdict eval --judge groq-70b --limit 2
+```
+
+`judge add` records a judge — a name, a model id (defaulting to `AGENTVERDICT_JUDGE_MODEL`), and
+its prompting config — so every verdict can be traced back to the exact recipe that produced it.
+
+`replay` runs the agent under test against stored tasks and saves each attempt as a new
+trajectory with `source="replay"`, printing one line per task. Narrow the sweep with
+`--task-key`, cap it with `--limit`, sample the same task several times with `--repeats`, pick
+the agent under test with `--adapter`, and override its model with `--model`. A task that blows
+up is reported and skipped; the rest of the sweep still runs.
+
+`eval` is the end-to-end suite: it replays, then judges *exactly* the trajectories it just
+created, and prints a combined summary. Pass `--skip-replay` to judge trajectories already in
+the store instead — that is how you score the judge against the labeled golden set.
+
+The summary tells you how many trajectories were replayed and judged, the verdict histogram
+(`pass` / `fail` / `borderline`), how many judge calls errored, and the input/output token
+totals for the run. Errors are counted rather than fatal: a malformed judge response or a
+failed API call is stored on the verdict row and the run continues. When the judged
+trajectories already carry human labels, the summary also prints a naive human-agreement
+figure — judge verdict versus the majority human verdict. Freshly replayed runs are unlabeled,
+so that line only appears on `--skip-replay` runs over the golden set; the real agreement
+statistics (Cohen's kappa, confusion matrix, bias breakdowns) arrive in M3.
+
+### Why tasks carry a separate user message
+
+A task's `prompt` is written for graders: it describes the scenario *and* states what a good
+agent should do, which is exactly what the expected outcome and the judge need. Sending that
+text to the agent under test would hand it the answer, and every replay would look brilliant.
+Tasks therefore also carry `user_message`, the first-person opening line a real customer would
+type ("Hi, my order NW-1001 never arrived"). Replay sends that; the grader-facing prompt never
+reaches the agent. Tasks without a `user_message` fall back to the prompt, which is fine for
+imported historical data but not what you want for a task you intend to replay.
+
+### Mock tools
+
+The agent's tools are backed by a fixture file, `examples/mock_tools.json`, rather than live
+systems:
+
+```json
+{"tools": {"lookup_order": {
+   "rules": [{"when": {"order_id": "NW-1001"},
+              "result": {"status": "delivered"}, "is_error": false}],
+   "default": {"result": {"error": "Order not found"}, "is_error": true}}}}
+```
+
+The first rule whose `when` entries all match the call's arguments (compared as trimmed strings)
+wins; otherwise the tool's `default` is returned; otherwise a generic error naming the unknown
+tool. Matching is deterministic — no randomness anywhere — so the same task and the same model
+output always produce the same tool results, and a replay can be reproduced.
+
+This is the point of the fixture format: adding a scenario means adding data, not code. Write
+the task (its `key`, grader prompt, `user_message`, `tools_spec`, and expected outcome), add any
+new tool responses to the fixture file, and it is replayable and gradable immediately.
+
 ## Architecture
 
 M1 is a deliberately small core — four tables and the tooling around them:
 
-- **tasks** — scenarios the agent-under-test should perform: a unique `key`, the prompt, the
-  tool specs available to the agent, an optional expected outcome, and tags.
+- **tasks** — scenarios the agent-under-test should perform: a unique `key`, the grader-facing
+  prompt, the customer-facing `user_message` replay sends to the agent, the tool specs available
+  to the agent, an optional expected outcome, and tags.
 - **trajectories** — one recorded agent run on a task: agent config, source
-  (`api|import|manual|langfuse`), status (`completed|error|truncated`), timing, and metadata.
+  (`api|import|manual|replay|langfuse`), status (`completed|error|truncated`), timing, and
+  metadata.
 - **trajectory_steps** — the ordered entries within a run: user/assistant/system messages, tool
   calls, and tool results, each with typed JSON content.
 - **human_labels** — one verdict (`pass|fail|borderline`) per (trajectory, annotator), with an
@@ -115,6 +230,14 @@ Trajectories round-trip through a line-oriented JSONL bundle format (one traject
 task upserted by key), which is how datasets move between machines and into version control.
 The FastAPI app serves the JSON API under `/api` and the server-rendered labeling UI at
 `/label`.
+
+The eval runner adds three tables on top of that core — **judges** (a named model plus its
+prompting config), **eval_runs** (one batch of judging, with its aggregate counts and tokens),
+and **judge_verdicts** (one decision, or one recorded failure, per trajectory per run; a judge
+may score the same trajectory in several runs, which is what repeat sampling needs). Replay
+lives beside it: an agent adapter is anything with a `name` and a `run(task)` that returns an
+ordered step list, so adapters never touch the database and swapping the bundled Groq reference
+agent for your own is a small class, not a fork.
 
 The full spec — data model, JSONL format, HTTP and CLI contracts, and milestone scope — lives
 in [DESIGN.md](DESIGN.md), which is the source of truth when code and docs disagree.

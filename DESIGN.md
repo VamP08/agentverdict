@@ -62,10 +62,48 @@ Two halves; the judging half ships first, the replay half second.
    `AGENTVERDICT_JUDGE_MODEL` (default `llama-3.3-70b-versatile`), base URL and timeout.
    Tests never hit the network: the client accepts an injected `httpx` transport.
 
-**Part 2 — task replay (next):** an agent adapter interface that executes an agent against
-stored tasks (starting with a built-in Groq tool-calling reference agent using each task's
-`tools_spec` with mocked tools) and records fresh trajectories, plus `agentverdict eval`
-combining replay + judging.
+**Part 2 — task replay (in progress):**
+
+1. **Agent adapter contract** (`agents/base.py`, frozen) — `AgentAdapter` is a Protocol with a
+   `name` and `run(task) -> AgentRunResult`; the result carries `steps` (list[StepIn]), `status`,
+   `agent_config`, `meta`, timestamps, and token counts. Adapters never touch the database.
+   `opening_message(task)` returns the first user turn.
+2. **Task `user_message`** (new nullable column) — `Task.prompt` describes the scenario for
+   graders and states what the agent *should* do, so replaying against it leaks the answer.
+   Tasks therefore carry a first-person customer opening line; `opening_message()` falls back to
+   `prompt` when it is absent. The JSONL bundle format gains an optional `task.user_message`.
+3. **Mock tools** (`agents/mock_tools.py` + `examples/mock_tools.json`) — a fixture-driven
+   registry so new scenarios need data, not code. Fixture shape:
+   ```json
+   {"tools": {"lookup_order": {
+      "rules": [{"when": {"order_id": "NW-1001"},
+                 "result": {"status": "delivered"}, "is_error": false}],
+      "default": {"result": {"error": "Order not found"}, "is_error": true}}}}
+   ```
+   First rule whose `when` entries all equal the call's arguments (compared as trimmed strings)
+   wins; otherwise `default`; otherwise a generic `is_error` result naming the unknown tool.
+   Matching is deterministic — no randomness, so replays are reproducible.
+4. **Groq reference agent** (`agents/groq_agent.py`) — a tool-calling loop over `chat`: send the
+   system persona + opening message with the task's `tools_spec` wrapped as
+   `{"type": "function", "function": spec}`; on `tool_calls`, record one `tool_call` step per
+   call, execute each through the registry, record `tool_result` steps, append the assistant and
+   `role: "tool"` messages, and iterate up to `max_turns` (default 8). A final text answer ends
+   the run (`completed`); exhausting the budget yields `truncated`; a client error or malformed
+   tool arguments records what happened and yields `error`. The system prompt is a generic
+   support persona and must never mention the expected outcome.
+5. **Replay runner** (`agents/replay.py`) — `run_replay(session, adapter, *, task_key, limit,
+   repeats, on_progress) -> ReplayReport` iterates tasks (optionally one key), calls the adapter
+   `repeats` times per task, persists each result as a `Trajectory` with `source="replay"` and
+   the adapter's `agent_config`, and returns created ids plus per-task errors. One failing task
+   never aborts the sweep.
+6. **CLI** — `agentverdict replay [--adapter --task-key --limit --repeats --model]` records new
+   trajectories; `agentverdict eval --judge NAME [...]` replays and then judges exactly the
+   trajectories it just created (via `run_eval(trajectory_ids=...)`), printing a combined
+   summary. `--skip-replay` judges existing trajectories instead.
+7. **Migrations** (Alembic, `migrations/`) — `tasks.user_message` is the first schema change
+   after M1, and `create_all` cannot add columns to existing tables. `agentverdict init-db` and
+   `serve` therefore run `upgrade head`; `db.init_db()` (create_all) remains the fast path for
+   tests. A test asserts `compare_metadata` finds no drift between migrations and the models.
 
 ## Repository layout
 
@@ -111,7 +149,8 @@ agentverdict/
 
 ## Data model (M1 tables)
 
-- **tasks** — `id` (hex uuid pk), `key` (unique slug), `prompt`, `tools_spec` (JSON list),
+- **tasks** — `id` (hex uuid pk), `key` (unique slug), `prompt`, `user_message` (nullable text;
+  the first-person opening line replay sends to the agent), `tools_spec` (JSON list),
   `expected_outcome` (nullable text), `tags` (JSON list), `created_at`.
 - **trajectories** — `id`, `task_id` (FK), `agent_config` (JSON), `source`
   (`api|import|manual|langfuse`), `status` (`completed|error|truncated`), `meta` (JSON),

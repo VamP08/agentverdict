@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 StepType = Literal["user_message", "assistant_message", "tool_call", "tool_result", "system"]
 TrajectoryStatus = Literal["completed", "error", "truncated"]
-TrajectorySource = Literal["api", "import", "manual", "langfuse"]
+TrajectorySource = Literal["api", "import", "manual", "replay", "langfuse"]
 LabelVerdict = Literal["pass", "fail", "borderline"]
 
 
@@ -19,6 +19,7 @@ LabelVerdict = Literal["pass", "fail", "borderline"]
 class TaskCreate(BaseModel):
     key: str = Field(min_length=1, max_length=200)
     prompt: str = Field(min_length=1)
+    user_message: str | None = None
     tools_spec: list[dict[str, Any]] = Field(default_factory=list)
     expected_outcome: str | None = None
     tags: list[str] = Field(default_factory=list)
@@ -166,6 +167,22 @@ class EvalRunRead(BaseModel):
     started_at: datetime
     completed_at: datetime | None
     created_at: datetime
+
+
+# --- Replay (M2) -------------------------------------------------------------
+
+
+class ReplayReport(BaseModel):
+    """Outcome of running an agent against a set of stored tasks."""
+
+    adapter: str
+    tasks_attempted: int = 0
+    trajectories_created: int = 0
+    error_count: int = 0
+    trajectory_ids: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 # --- Import / stats ----------------------------------------------------------

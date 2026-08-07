@@ -77,10 +77,15 @@ def run_eval(
     *,
     task_key: str | None = None,
     limit: int | None = None,
+    trajectory_ids: list[str] | None = None,
     client: GroqChatClient | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> EvalRun:
-    """Judge trajectories (optionally filtered) and return the completed EvalRun."""
+    """Judge trajectories (optionally filtered) and return the completed EvalRun.
+
+    ``trajectory_ids`` scores exactly those trajectories — used by ``eval`` to judge
+    only the runs it just replayed. An empty list judges nothing.
+    """
     stmt = (
         select(Trajectory)
         .join(Task, Trajectory.task_id == Task.id)
@@ -93,6 +98,9 @@ def run_eval(
     )
     if task_key is not None:
         stmt = stmt.where(Task.key == task_key)
+    if trajectory_ids is not None:
+        # in_([]) is a valid empty-set filter in SQLAlchemy 2.0 and judges nothing.
+        stmt = stmt.where(Trajectory.id.in_(trajectory_ids))
     if limit is not None:
         stmt = stmt.limit(limit)
     trajectories = list(session.scalars(stmt))

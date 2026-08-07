@@ -19,7 +19,7 @@ calls.
 - [x] CLI (`init-db`, `import`, `export`, `stats`, `serve`), pytest suite on in-memory SQLite,
       ruff-clean, CI workflow, docker-compose for Postgres
 
-## M2 — Eval runner (in progress)
+## M2 — Eval runner (done)
 
 Replay tasks against agents and score the results with an LLM judge.
 
@@ -27,11 +27,11 @@ Replay tasks against agents and score the results with an LLM judge.
 - [x] Judge, eval-run, and judge-verdict tables added to the data model
 - [x] `agentverdict judge` CLI (add / list / run) printing a scored summary with a naive
       human-agreement readout; judge verdicts surfaced in the labeling UI and API
-- [ ] Task replay harness that executes an agent against stored tasks and records new
+- [x] Task replay harness that executes an agent against stored tasks and records new
       trajectories automatically
-- [ ] `agentverdict eval` CLI combining replay + judging into one end-to-end suite run
+- [x] `agentverdict eval` CLI combining replay + judging into one end-to-end suite run
 
-## M3 — Calibration lab (planned)
+## M3 — Calibration lab (next)
 
 Measure the judge against the humans before trusting it.
 

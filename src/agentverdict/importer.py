@@ -71,6 +71,7 @@ def _get_or_create_task(
         task = Task(
             key=payload.key,
             prompt=payload.prompt,
+            user_message=payload.user_message,
             tools_spec=payload.tools_spec,
             expected_outcome=payload.expected_outcome,
             tags=payload.tags,
@@ -155,6 +156,7 @@ def _as_bundle(trajectory: Trajectory) -> dict[str, Any]:
         "task": {
             "key": task.key,
             "prompt": task.prompt,
+            "user_message": task.user_message,
             "tools_spec": task.tools_spec,
             "expected_outcome": task.expected_outcome,
             "tags": task.tags,

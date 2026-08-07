@@ -27,6 +27,7 @@ def create_task(payload: TaskCreate, session: SessionDep) -> TaskRead:
     task = Task(
         key=payload.key,
         prompt=payload.prompt,
+        user_message=payload.user_message,
         tools_spec=payload.tools_spec,
         expected_outcome=payload.expected_outcome,
         tags=payload.tags,

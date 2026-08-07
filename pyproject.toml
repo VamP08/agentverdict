@@ -20,6 +20,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "psycopg[binary]>=3.2",
     "httpx>=0.27",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +35,11 @@ agentverdict = "agentverdict.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentverdict"]
+
+# The mock tool fixtures live in examples/ so they are easy to find and edit, but
+# replay needs them at runtime — ship a copy inside the package too.
+[tool.hatch.build.targets.wheel.force-include]
+"examples/mock_tools.json" = "agentverdict/agents/data/mock_tools.json"
 
 [tool.ruff]
 line-length = 100

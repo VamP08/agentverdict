@@ -1,0 +1,185 @@
+{
+  "notes": [
+    "Fixtures for the Northwind Gadgets support scenarios in sample_trajectories.jsonl.",
+    "Known orders: NW-1001 (delivered, damaged), NW-2002 (in transit), NW-3003 (overdue),",
+    "NW-4004 (lost in transit). Every other id - NW-9999, for instance - falls through to",
+    "the tool's default branch and comes back as an error, which is what the ambiguous",
+    "scenario needs when an agent guesses an order id instead of asking for one."
+  ],
+  "tools": {
+    "lookup_order": {
+      "description": "Fetch an order by id.",
+      "rules": [
+        {
+          "when": {"order_id": "NW-1001"},
+          "result": {
+            "order_id": "NW-1001",
+            "status": "delivered",
+            "item": "AeroMouse Wireless Mouse",
+            "quantity": 1,
+            "total": 34.99,
+            "currency": "USD",
+            "customer_email": "maya.p@example.com",
+            "carrier": "FastShip",
+            "tracking": "FS-4410-1001",
+            "placed_on": "2026-07-14",
+            "delivered_on": "2026-07-18"
+          },
+          "is_error": false
+        },
+        {
+          "when": {"order_id": "NW-2002"},
+          "result": {
+            "order_id": "NW-2002",
+            "status": "in_transit",
+            "item": "VoltHub 7-in-1 USB-C Dock",
+            "quantity": 1,
+            "total": 79.5,
+            "currency": "USD",
+            "customer_email": "j.mercer@example.com",
+            "carrier": "FastShip",
+            "tracking": "FS-4471-2002",
+            "placed_on": "2026-08-01",
+            "promised_on": "2026-08-04",
+            "eta": "2026-08-11"
+          },
+          "is_error": false
+        },
+        {
+          "when": {"order_id": "NW-3003"},
+          "result": {
+            "order_id": "NW-3003",
+            "status": "delayed",
+            "item": "PixelFrame 10 Digital Frame",
+            "quantity": 1,
+            "total": 89.0,
+            "currency": "USD",
+            "customer_email": "d.okafor@example.com",
+            "carrier": "FastShip",
+            "tracking": "FS-8890-3003",
+            "placed_on": "2026-07-10",
+            "promised_on": "2026-07-24",
+            "eta": "2026-08-14",
+            "days_late": 14,
+            "last_scan": "2026-07-19 - held at regional depot"
+          },
+          "is_error": false
+        },
+        {
+          "when": {"order_id": "NW-4004"},
+          "result": {
+            "order_id": "NW-4004",
+            "status": "lost_in_transit",
+            "item": "TrailCam 4K Trail Camera",
+            "quantity": 1,
+            "total": 129.5,
+            "currency": "USD",
+            "customer_email": "chris.v@example.com",
+            "carrier": "FastShip",
+            "tracking": "FS-1123-4004",
+            "placed_on": "2026-07-06",
+            "promised_on": "2026-07-13",
+            "last_scan": "2026-07-09 - no movement since; carrier declared the parcel lost"
+          },
+          "is_error": false
+        }
+      ],
+      "default": {
+        "result": {
+          "error": "order_not_found",
+          "detail": "No Northwind Gadgets order exists with that id. Ask the customer to confirm the order id from their confirmation email."
+        },
+        "is_error": true
+      }
+    },
+    "refund_order": {
+      "description": "Issue a full refund for an order.",
+      "rules": [
+        {
+          "when": {"order_id": "NW-1001"},
+          "result": {
+            "refund_id": "RF-11001",
+            "order_id": "NW-1001",
+            "amount": 34.99,
+            "currency": "USD",
+            "status": "processed",
+            "expected_in_account": "3-5 business days"
+          },
+          "is_error": false
+        },
+        {
+          "when": {"order_id": "NW-2002"},
+          "result": {
+            "refund_id": "RF-12002",
+            "order_id": "NW-2002",
+            "amount": 79.5,
+            "currency": "USD",
+            "status": "processed",
+            "expected_in_account": "3-5 business days"
+          },
+          "is_error": false
+        },
+        {
+          "when": {"order_id": "NW-3003"},
+          "result": {
+            "refund_id": "RF-13003",
+            "order_id": "NW-3003",
+            "amount": 89.0,
+            "currency": "USD",
+            "status": "processed",
+            "expected_in_account": "3-5 business days"
+          },
+          "is_error": false
+        },
+        {
+          "when": {"order_id": "NW-4004"},
+          "result": {
+            "refund_id": "RF-14004",
+            "order_id": "NW-4004",
+            "amount": 129.5,
+            "currency": "USD",
+            "status": "processed",
+            "expected_in_account": "3-5 business days"
+          },
+          "is_error": false
+        }
+      ],
+      "default": {
+        "result": {
+          "error": "refund_failed",
+          "detail": "No refund was issued: that order id does not exist. Look the order up before refunding it."
+        },
+        "is_error": true
+      }
+    },
+    "send_email": {
+      "description": "Send an email to a customer.",
+      "rules": [
+        {
+          "when": {"to": "maya.p@example.com"},
+          "result": {"message_id": "em-20001", "to": "maya.p@example.com", "status": "sent"},
+          "is_error": false
+        },
+        {
+          "when": {"to": "j.mercer@example.com"},
+          "result": {"message_id": "em-20002", "to": "j.mercer@example.com", "status": "sent"},
+          "is_error": false
+        },
+        {
+          "when": {"to": "d.okafor@example.com"},
+          "result": {"message_id": "em-20003", "to": "d.okafor@example.com", "status": "sent"},
+          "is_error": false
+        },
+        {
+          "when": {"to": "chris.v@example.com"},
+          "result": {"message_id": "em-20004", "to": "chris.v@example.com", "status": "sent"},
+          "is_error": false
+        }
+      ],
+      "default": {
+        "result": {"message_id": "em-20099", "status": "sent"},
+        "is_error": false
+      }
+    }
+  }
+}

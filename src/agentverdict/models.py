@@ -82,6 +82,10 @@ class Task(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     key: Mapped[str] = mapped_column(String(200), unique=True, index=True)
     prompt: Mapped[str] = mapped_column(Text)
+    # The opening customer message a replayed agent receives. The prompt above
+    # describes the scenario for graders and would leak expected behavior to the
+    # agent under test, so replay uses this instead (falling back to prompt).
+    user_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     tools_spec: Mapped[list] = mapped_column(JSON, default=list)
     expected_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
     tags: Mapped[list] = mapped_column(JSON, default=list)
