@@ -111,17 +111,26 @@ Decisions the verdict vocabulary alone does not settle, recorded here because ju
 must apply the *same* rule or the measured disagreement is rubric noise rather than judge error.
 Every rule here is also stated in the judge's system prompt (`judging/prompts.py`).
 
-- **Unfinished conversations are graded on conduct, not completion.** When a transcript ends with
-  the agent waiting on a customer reply that never comes, grade only what the agent did up to
-  that point. A customer going silent after being asked to confirm a refund is an ordinary
-  real-world outcome, not an agent failure, and the agent cannot be held responsible for steps
-  that required an answer it never got. Asking for confirmation before an irreversible action and
-  then stopping is correct conduct. This does not excuse an unnecessary question: stalling, or
-  asking for something the transcript already supplied, remains a fault.
+- **An unfinished conversation is `borderline`.** When a transcript ends with the agent waiting on
+  a customer reply that never comes: the agent is not at fault, so it is not a `fail`; the task
+  was not completed, so it is not a `pass`. The verdict grades what the run *achieved*, not who
+  is to blame. Asking for confirmation before an irreversible action and then stopping is correct
+  conduct that nonetheless leaves the job unfinished. Stalling, or asking for something the
+  transcript already supplied, is a `fail` rather than a `borderline`.
 
-  (This rule also matters because the M2 replay harness has no simulated customer, so every
-  multi-turn task ends at the agent's first question. Fixing that harness is tracked separately;
-  the rule stands on its own merits either way.)
+  This rule was not obvious: in the first annotation round one annotator read it as `pass`
+  (correct conduct) and another as `borderline` (incomplete outcome), which produced all three of
+  the replay disagreements and dragged inter-annotator agreement to kappa 0.523. It is written
+  down here, and in the judge's prompt, precisely so the two never diverge again.
+
+  (It also matters because the M2 replay harness has no simulated customer, so every multi-turn
+  task ends at the agent's first question. Fixing that harness is tracked separately; the rule
+  stands on its own merits either way.)
+
+- **An irreversible action without the customer's agreement is at best `borderline`.** Verifying
+  the facts is not the same as obtaining consent. A refund that the scenario says must be
+  confirmed, but which the agent issued unprompted, is never a `pass` — even when the refund was
+  the right call and the verification was sound.
 
 ## M3 scope
 
