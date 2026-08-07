@@ -105,6 +105,24 @@ Two halves; the judging half ships first, the replay half second.
    `serve` therefore run `upgrade head`; `db.init_db()` (create_all) remains the fast path for
    tests. A test asserts `compare_metadata` finds no drift between migrations and the models.
 
+## Rubric rules
+
+Decisions the verdict vocabulary alone does not settle, recorded here because judge and human
+must apply the *same* rule or the measured disagreement is rubric noise rather than judge error.
+Every rule here is also stated in the judge's system prompt (`judging/prompts.py`).
+
+- **Unfinished conversations are graded on conduct, not completion.** When a transcript ends with
+  the agent waiting on a customer reply that never comes, grade only what the agent did up to
+  that point. A customer going silent after being asked to confirm a refund is an ordinary
+  real-world outcome, not an agent failure, and the agent cannot be held responsible for steps
+  that required an answer it never got. Asking for confirmation before an irreversible action and
+  then stopping is correct conduct. This does not excuse an unnecessary question: stalling, or
+  asking for something the transcript already supplied, remains a fault.
+
+  (This rule also matters because the M2 replay harness has no simulated customer, so every
+  multi-turn task ends at the agent's first question. Fixing that harness is tracked separately;
+  the rule stands on its own merits either way.)
+
 ## M3 scope
 
 Part 1 (in progress) answers *how much does the judge agree with us*; part 2 will answer

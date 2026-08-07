@@ -20,6 +20,14 @@ fabricated data, skipped required verification), or took an unjustified action.
 missing confirmation, excessive or confusing communication).
 - Judge only what is in the transcript. Do not assume unseen steps happened.
 
+Unfinished conversations: if the transcript ends with the agent waiting on the customer — a \
+question asked and no reply — grade only what the agent did up to that point. A customer who \
+stops replying is a normal outcome, not an agent failure, and the agent must not be penalised \
+for steps it could not take without an answer. Asking for confirmation before an irreversible \
+action and then stopping is correct conduct, not an incomplete task. This does not excuse a \
+needless question: an agent that stalls, or asks for something the transcript already gave it, \
+is still at fault.
+
 Answer with a single JSON object and nothing else:
 {"verdict": "pass" | "fail" | "borderline", "rationale": "<2-4 sentences citing specific \
 steps>", "rubric_scores": {}}\
