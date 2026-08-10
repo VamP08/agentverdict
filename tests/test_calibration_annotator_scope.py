@@ -226,8 +226,10 @@ def two_rounds(
 
     ``unfinished`` is the trajectory the rubric rule now settles: in round one vamp
     read a stopped-but-correct conversation as a pass and momo as borderline, which
-    is a tie. In round two, with the rule written down, both call it borderline —
-    and so does the judge, whose prompt states the same rule.
+    is a tie. In round two, with the rule written down, both call it pass — the rule
+    grades the agent's conduct, not whether the customer replied. The judge's stored
+    verdict is deliberately left at the round-one reading, so this fixture also holds
+    a judge that has fallen behind the rubric, which is a state the report must survive.
     """
     judge = make_judge(name="groq-70b", model="llama-test-model")
     trajectories = {
@@ -242,7 +244,7 @@ def two_rounds(
     }
     round_two = {
         "clean": ("pass", "pass"),
-        "unfinished": ("borderline", "borderline"),  # settled by the rubric rule
+        "unfinished": ("pass", "pass"),  # settled by the rubric rule: grade the agent
         "broken": ("fail", "fail"),
     }
     for name, (vamp_verdict, momo_verdict) in round_one.items():
@@ -307,25 +309,38 @@ def test_the_two_rounds_report_different_numbers(
 
     assert (first.compared, first.ties_excluded) != (second.compared, second.ties_excluded)
 
-    # The headline is blind to the improvement: it was already perfect in round
-    # one, because the item the annotators disagreed about had been thrown away.
+    # Round one's headline is a perfect score built on an exclusion: the one item the
+    # annotators split on was a tie and was thrown away, so the judge is reported as
+    # disagreeing with nobody on a dataset where half the panel disagreed with it.
     assert first.agreement.observed_agreement == pytest.approx(1.0)
-    assert second.agreement.observed_agreement == pytest.approx(1.0)
 
-    # The per-rater rows are where the clarification shows up. vamp missed the
-    # unfinished conversation in round one and matched the judge in round two.
+    # Round two is the useful direction of surprise. The annotators now agree with each
+    # other, the tie is gone, and the headline gets *worse* -- because the item that
+    # reappears is one the judge gets wrong. Its stored verdict predates the rewritten
+    # rule, so it still reads an open ending as borderline where the rule now says pass.
+    # A calibration number that improved here would be hiding a judge left behind by
+    # its own rubric.
+    assert second.agreement.observed_agreement == pytest.approx(2 / 3)
+
+    # Both annotators moved together, so the disagreement is squarely judge-vs-humans
+    # rather than a rater who missed the memo.
     first_rows = {row.annotator: row for row in first.judge_vs_annotator}
     second_rows = {row.annotator: row for row in second.judge_vs_annotator}
     assert all(row.n == 3 for row in first.judge_vs_annotator)
     assert all(row.n == 3 for row in second.judge_vs_annotator)
     assert first_rows["vamp"].observed_agreement == pytest.approx(2 / 3)
-    assert second_rows["vamp-r2"].observed_agreement == pytest.approx(1.0)
     assert first_rows["momo"].observed_agreement == pytest.approx(1.0)
-    assert second_rows["momo-r2"].observed_agreement == pytest.approx(1.0)
+    assert second_rows["vamp-r2"].observed_agreement == pytest.approx(2 / 3)
+    assert second_rows["momo-r2"].observed_agreement == pytest.approx(2 / 3)
 
-    # And so does the human ceiling: the round-one split is gone.
+    # The human ceiling is where the clarification actually shows up: the round-one
+    # split between the two annotators is gone.
     assert first.human_ceiling[0].observed_agreement == pytest.approx(2 / 3)
     assert second.human_ceiling[0].observed_agreement == pytest.approx(1.0)
+
+    # And the drill-down now names the item, which round one could not do at all.
+    assert first.disagreements == []
+    assert len(second.disagreements) == 1
 
 
 def test_round_one_labels_are_preserved_rather_than_replaced(

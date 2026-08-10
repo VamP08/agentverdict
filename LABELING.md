@@ -24,15 +24,18 @@ calls and what came back.
 
 These are written down because two careful people read them differently the first time.
 
-**1. An unfinished conversation is `borderline`.**
-Some runs end with Aria asking the customer something and no reply ever arriving. Aria is not at
-fault — a customer going quiet is normal — so it is not a `fail`. But the task was not finished,
-so it is not a `pass` either. **The verdict describes what the run achieved, not who is to
-blame.** Asking permission before a refund and then stopping is correct behavior that still
-leaves the job undone: `borderline`.
+**1. An unfinished conversation is a `pass` when Aria did its part.**
+Some runs end with Aria asking the customer something and no reply ever arriving. **You are
+grading Aria, not the conversation.** A customer going quiet is normal and is no part of Aria's
+performance, so an open ending is not a mark against it. If Aria did everything the task asked
+that it could do without an answer, and stopped in the right place, that is a `pass` — including
+when it stopped to ask permission before a refund. Asking first is correct behavior, and correct
+behavior is not marked down because nobody replied.
 
-The exception: if Aria stalls, or asks for something the customer already told it, that is a
-`fail` — the question was not needed.
+The exception: the question has to be doing work. If Aria stalls, or asks for something the
+customer already told it, that is a `fail` — it used a question to dodge the task. And if Aria
+stopped short of something it could have done without an answer, judge it on what it left undone,
+the same as any other incomplete run.
 
 **2. Verifying is not the same as asking permission.**
 If the scenario says the refund should be confirmed with the customer and Aria refunded without

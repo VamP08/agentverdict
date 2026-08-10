@@ -154,17 +154,35 @@ Decisions the verdict vocabulary alone does not settle, recorded here because ju
 must apply the *same* rule or the measured disagreement is rubric noise rather than judge error.
 Every rule here is also stated in the judge's system prompt (`judging/prompts.py`).
 
-- **An unfinished conversation is `borderline`.** When a transcript ends with the agent waiting on
-  a customer reply that never comes: the agent is not at fault, so it is not a `fail`; the task
-  was not completed, so it is not a `pass`. The verdict grades what the run *achieved*, not who
-  is to blame. Asking for confirmation before an irreversible action and then stopping is correct
-  conduct that nonetheless leaves the job unfinished. Stalling, or asking for something the
-  transcript already supplied, is a `fail` rather than a `borderline`.
+- **An unfinished conversation is a `pass` when the agent did its part.** When a transcript ends
+  with the agent waiting on a customer reply that never comes, the verdict grades **the agent, not
+  the conversation**. A customer who goes quiet is an ordinary outcome and no part of the agent's
+  performance, so an open ending is not itself a defect. An agent that did everything the task
+  asked which could be done without an answer, and stopped in the right place, earns a `pass` —
+  including when it stopped to ask permission before an irreversible action.
 
-  This rule was not obvious: in the first annotation round one annotator read it as `pass`
-  (correct conduct) and another as `borderline` (incomplete outcome), which produced all three of
-  the replay disagreements and dragged inter-annotator agreement to kappa 0.523. It is written
-  down here, and in the judge's prompt, precisely so the two never diverge again.
+  The question has to be doing work. Stalling, or asking for something the transcript already
+  supplied, is a `fail`: a question used to avoid the task. An agent that stopped short of a step
+  it could have completed unaided is graded on what it left undone, like any other incomplete run.
+
+  **This rule was rewritten on 2026-08-11, and the previous version is why rubric versioning
+  exists.** It first read *"an unfinished conversation is `borderline`"* — the task was not
+  completed, so not a `pass`. That reading dragged round-one inter-annotator agreement to kappa
+  0.523 on its own, and once it was written into the judge's prompt it over-fired: on
+  `order-status-01` the agent looked up the order, reported status and ETA exactly as asked, then
+  offered tracking details, and the judge downgraded a completed task to `borderline` ten times
+  out of ten, its own rationale citing this rule. Both annotators had called it `pass`. The rule
+  could not tell *"the goal still needs the customer's answer"* from *"the goal is met and the
+  agent offered a courtesy"*.
+
+  The correction is the principle above: grade the agent's conduct, not the conversation's
+  completeness. A gate is supposed to detect changes in the agent, and a verdict that moves with
+  whether a simulated customer happened to reply is noise wearing the name of quality.
+
+  Consequences, which are the point of tracking a rubric version: verdicts recorded under the old
+  wording are not comparable with verdicts recorded under this one, `PROMPT_VERSION` changes, and
+  round-one human labels that read an open ending as `borderline` are stale — they were correct
+  under the rulebook in force when they were made.
 
   (It also matters because the M2 replay harness has no simulated customer, so every multi-turn
   task ends at the agent's first question. Fixing that harness is tracked separately; the rule
@@ -177,9 +195,10 @@ Every rule here is also stated in the judge's system prompt (`judging/prompts.py
 
 ## M3 scope
 
-Part 1 (in progress) answers *how much does the judge agree with us*; part 2 will answer
-*where is it systematically wrong* (position, verbosity, and self-preference probes, plus
-rubric versioning).
+Part 1 answers *how much does the judge agree with us*; part 2 answers *where is it
+systematically wrong* — order sensitivity, length sensitivity, structured per-criterion
+agreement, and rubric versioning. Self-preference is deliberately **not** in part 2; see the
+end of the part 2 section for why, and M4 for where it went.
 
 **Part 1 — the agreement core:**
 
@@ -211,8 +230,174 @@ rubric versioning).
    their kappa) and `/calibration/{judge_id}` (matrix, ceiling, drill-down linking to each
    trajectory).
 
-Calibration is computed on demand — there is no report table. Nothing here calls a model: it is
-pure analysis over verdicts already stored, so it is free to run and safe in CI.
+**Part 2 — the bias probes, per-criterion agreement, and rubric versioning:**
+
+*This section was rewritten after an adversarial methodology review of its first draft. Fourteen
+findings against that draft were fatal, and the errors are recorded here rather than quietly
+corrected, because most of them are the errors this field actually makes.*
+
+1. **The literature does not transfer, and the re-derivation is named honestly.** Position,
+   verbosity, and self-preference bias are defined for **pairwise** judges — "here are A and B,
+   which is better?" — and position bias is measured by swapping A and B. This judge is a
+   **pointwise absolute grader**: one trajectory in, one of `pass`/`borderline`/`fail` out. There
+   is no A and no B. Copying the pairwise protocol would mean building a second judging mode the
+   regression gate never uses, and then publishing bias figures for a judge that is not the judge
+   in production. So each probe is re-derived, and the re-derivation gets its own name rather
+   than borrowing prestige from the one in the papers. Probe 1 is **order sensitivity**, not
+   position bias. Probe 2 is **length sensitivity**, not verbosity bias.
+
+2. **The estimator, stated before any code.** Repeats within an arm are exchangeable, so no
+   repeat has a privileged partner in another arm; a "flip rate" that pairs repeat 1 with repeat
+   1 is not a statistic, it is an artifact of list order. Every cross-arm figure is therefore
+   computed over **all** control x variant repeat pairs, and the judge's own noise floor over the
+   **distinct unordered** pairs within the identity arm. Self-pairs are excluded: a repeat agrees
+   with itself with probability one, and including them would drag the measured noise floor
+   toward zero — biasing every probe toward finding bias. Granularity is 1/R² rather than 1/R,
+   which is free and matters a great deal at this n. **`--repeats` must be at least 2**, enforced
+   with an explicit error: at R=1 the control arm is zero by construction and measures nothing.
+
+3. **The headline statistic is the signed ordinal shift, not the flip rate.** A flip rate
+   responds to the judge's *entropy*, not to bias: a perturbation that scatters answers
+   symmetrically raises it without moving the verdict distribution's centre at all. Verdicts are
+   ordinal (`VERDICT_SCORES`), the claim is directional, so the primary figure is the mean signed
+   movement and the flip rate is reported beside it as a secondary. Running both as co-headlines
+   would also double the family-wise error rate for free.
+
+4. **Two controls, because one of them cannot work alone.** The identity arm re-judges
+   byte-identical input. Measured on this judge: 30 out of 30 calls returned the same verdict at
+   temperature 0, so that arm reports a flip rate of zero — which cannot distinguish *"the
+   perturbation had no effect"* from *"nothing was ever perturbed"*. Two more guards:
+   - a **format-null arm**, semantically identical but byte-different (different section joiner
+     and trailing whitespace), which isolates raw prompt-format jitter from real order effects;
+   - a **delivery check** from the `prompt_sha` already stored per result: every variant must
+     differ from identity for every trajectory. An arm where it does not gets outcome
+     `not_applied`, never `inconclusive`. Reporting a broken harness as "no bias detected" is the
+     single easiest way for this whole milestone to be worthless.
+
+5. **Power is computed and printed, not hoped for.** With a percentile bootstrap over n items, if
+   k items move and n−k sit at exactly zero, the resample distribution carries an atom at zero of
+   size ((n−k)/n)^n. At n=13 that is 0.353 for k=1, 0.114 for k=2, 0.033 for k=3, 0.0084 for k=4
+   — so **the 2.5th percentile clears zero only once four trajectories move**. Three trajectories
+   flipping under a reordered prompt is alarming and would be reported `inconclusive` by
+   construction rather than by evidence.
+
+   The bound barely depends on n, which is the part worth internalising: ((n−k)/n)^n → e^−k, and
+   the 0.025 threshold falls between e^−3 = 0.0498 and e^−4 = 0.0183. **Four movers is the floor
+   at n=13 and still the floor at n=60.** Collecting more trajectories does not buy the ability
+   to detect a two-trajectory effect; it only lowers the *rate* four movers corresponds to. A
+   probe that wants to catch rare-but-real order sensitivity needs either many more items or a
+   statistic that is not a percentile bootstrap on a mostly-zero vector, and this document
+   commits to saying which of those is missing rather than shipping an interval that cannot
+   move. Every probe result therefore carries `min_movers`
+   (computable from n alone, before spending a token), `movers_observed`, the measured
+   `control_flip_rate` with its own interval, an MDE computed *after* the identity arm, and
+   `power_limited` — true when the outcome is `inconclusive` and fewer than `min_movers` moved.
+   "This instrument cannot see an effect this small" is a result. A silent `inconclusive` is not.
+
+6. **Resample tasks, then trajectories within task.** Trajectories replayed from the same task
+   share the task prompt, the expected outcome, and the tools block — which is exactly what the
+   order probe permutes. Resampling them flat would report a quirk of one scenario as a property
+   of the judge. The regression gate already refuses to do this (M5: *pairing is by task, never
+   by trajectory*), and part 2 is held to the same rule. Every result prints `n over k tasks` so
+   the cluster count is never hidden.
+
+7. **Probes read the whole store, not the labeled slice.** A probe compares the judge against
+   itself, so it needs no human labels — all trajectories qualify, not the 9 with a human
+   majority. But n is not inflated by replaying the same five tasks: that buys pseudo-replicates,
+   not evidence. Only new task keys buy independence.
+
+8. **Multiplicity is controlled.** Five to seven uncorrected 95% intervals give a perfectly
+   unbiased judge roughly a one-in-four chance of being reported as biased somewhere. The number
+   of intervals in a run is fixed and known in advance, so the per-interval level is adjusted for
+   it and the adjustment is printed.
+
+9. **A flip is scored for direction against the human labels.** Where a trajectory has a human
+   majority, a verdict that moves *toward* it under perturbation is a correction, not a bias, and
+   the report says which way each flip went. The labels are already there; not looking at them
+   would be the strange choice.
+
+10. **The arms.**
+    - Order: `identity`, `format_null`, `context_last`, `reversed_context`. The transcript is
+      never reordered — reordering an agent's steps changes what the agent did, which is a
+      different run, not the same run seen differently.
+    - Length: `identity`, `padded_1x`, `padded_2x`, `padded_3x` — a dose ladder from a fixed
+      filler table, applied to `assistant_message` steps only. **Perturbations may only add
+      characters, never remove or rewrite them**, so content preservation holds by construction
+      rather than by an auditor's judgement. The first draft's `terse` arm (truncate to the first
+      sentence) was cut: on this corpus it deletes a consent request or a closing question in 8
+      of 13 labeled trajectories, and those are precisely the facts the rubric rules turn on. A
+      judge that downgrades a run whose consent request was deleted is judging correctly, and
+      reporting that as bias would be the exact error this milestone exists to catch.
+    - Filler is first-person, declarative, and may not reference the customer's next action or
+      the end of the conversation — enforced by test, not by comment, so nobody can add
+      `"Shall I proceed?"` to the bank and turn a length probe into a rubric probe.
+
+11. **Length sensitivity is not assumed to be a defect.** The rubric *licenses* some: the judge's
+    own prompt names "excessive or confusing communication" as a borderline criterion, and on the
+    golden set both annotators independently marked a verbose-but-correct run down for it
+    ("Too many words used for communication, the process was handled correctly so its not a
+    fail"). A downward shift under padding is therefore jointly predicted by the written rubric
+    and by unanimous human behaviour. What the probe measures is whether the judge's length
+    sensitivity **exceeds what the rubric licenses**, and it says so rather than reporting
+    obedience as bias.
+
+12. **The perturbation seam never touches ORM objects.** Trajectories are SQLAlchemy instances
+    with cascade-deleting steps; mutating a loaded `TrajectoryStep` and letting the session flush
+    would write filler into the golden dataset permanently and silently. Perturbations operate on
+    plain rendered strings, downstream of the ORM, and the probe runner opens no writable path to
+    trajectory rows.
+
+13. **The prompt fingerprint is not touched.** `build_messages` and `_USER_PROMPT_SHAPE` are
+    load-bearing for `PROMPT_VERSION`, which the regression gate now enforces; changing either
+    would invalidate every stored baseline. Probe rendering lives in its own module with its own
+    section assembly. Each run records the **unperturbed** `PROMPT_VERSION` (the artifact under
+    test) and each result row its own `prompt_sha`.
+
+14. **Probe verdicts never enter `judge_verdicts`.** Those rows feed calibration and the merge
+    gate; a verdict on a deliberately corrupted transcript is not a verdict on the run. Two new
+    tables (`bias_probe_runs`, `bias_probe_results`, migration `0004`), and results keep the
+    judge's **rationale** — a probe whose only output is a flip count gives nobody anything to
+    act on.
+
+15. **Per-criterion agreement — judging on the written remark.** The verdict token is a coarse
+    summary of a judgement, and two raters can reach the same token for opposite reasons or
+    different tokens from identical readings. The `order-status-01` case is the second kind: the
+    judge's rationale agreed with both annotators that the agent did what was asked, and the
+    verdicts still split, because the disagreement lived entirely in the aggregation rule. So the
+    rubric is made structured. `Rubric.criteria` (already in the schema as
+    `[{key, description, weight}]`) holds named criteria; the judge fills `JudgeVerdict.
+    rubric_scores` and annotators fill `HumanLabel.rubric_scores` — both fields exist today and
+    are always empty. Calibration then reports agreement **per criterion** alongside the verdict,
+    which localises every disagreement to one of two causes: *they read the run differently*, or
+    *they read it the same and the rubric mapped it differently*. Only the first is a judge
+    problem. The second is a rubric problem, and it is the one this project has actually hit.
+
+16. **Rubric versioning, activated.** A calibration number is meaningless unless the humans and
+    the judge were applying the same rulebook. Round one was labeled under an unwritten rubric;
+    the unfinished-conversation rule has since been rewritten (see *Rubric rules*), which changes
+    `PROMPT_VERSION` and makes round-one labels stale rather than wrong. A `rubrics` row is
+    created from the written rules, the labeling UI records which version was on screen in
+    `human_labels.rubric_id`, and a report that spans two versions **says so** instead of
+    averaging across two rulebooks. The judge side already carries `PROMPT_VERSION`; the report
+    names both, and warns when they disagree about which rubric is in force.
+
+17. **Self-preference is deferred to M4, with the reason on the record.** It needs the estimator
+    to be a difference-in-differences — "the mean this judge gives own-family trajectories minus
+    the mean other judges give them" is positive for any judge that is simply more generous than
+    average, so the draft's version measured **leniency** and would have labelled it
+    self-preference. It also needs data this database does not have: one registered judge, and 27
+    llama trajectories against 2 from another family. On an n=2 arm the bootstrap returns a
+    zero-width interval, which reads as a finding at 100% confidence. The families exist on the
+    provider (llama, gpt-oss, qwen, all verified to tool-call), so this is a data-collection
+    problem rather than a feasibility one — which is what M4 is for.
+
+18. **Surfaces** — `agentverdict probe JUDGE [--probe NAME] [--limit N] [--repeats N] [--json]`
+    (repeats >= 2, enforced); `GET /api/judges/{judge_id}/bias`; and a section on the existing
+    `/calibration/{judge_id}` page.
+
+Calibration is computed on demand — there is no report table. Nothing in part 1 calls a model: it
+is pure analysis over verdicts already stored, so it is free to run and safe in CI. Part 2's
+probes do call a model, which is why they are a separate command and never run inside the gate.
 
 **Empty-state matters.** Until trajectories carry both a human label and a judge verdict, every
 statistic is undefined. The report says so explicitly and names the two commands that fix it,

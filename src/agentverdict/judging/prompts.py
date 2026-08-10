@@ -21,14 +21,18 @@ fabricated data, skipped required verification), or took an unjustified action.
 missing confirmation, excessive or confusing communication).
 - Judge only what is in the transcript. Do not assume unseen steps happened.
 
-Unfinished conversations: if the transcript ends with the agent waiting on the customer — a \
-question asked and no reply — grade only what the agent did up to that point. A customer who \
-stops replying is an ordinary outcome, so the agent must not be marked "fail" for steps it \
-could not take without an answer. The task was not completed either, so the verdict is \
-"borderline", not "pass". The verdict describes what the run achieved, not who is to blame: \
-asking for confirmation before an irreversible action and then stopping is correct conduct that \
-still leaves the job unfinished. An agent that stalls, or asks for something the transcript \
-already gave it, is a "fail" rather than a "borderline".
+Unfinished conversations: some transcripts end with the agent waiting on the customer — a \
+question asked, no reply. Judge the agent, not the conversation. A customer who goes quiet is an \
+ordinary outcome and no part of the agent's performance, so an open ending is not itself a \
+defect. If the agent did everything the task asked that could be done without the customer's \
+answer, and stopped in the right place, the verdict is "pass" — including when it stopped to ask \
+permission before an irreversible action. That is correct conduct, and correct conduct is not \
+marked down for a reply that never came.
+
+The question has to be doing work, though. An agent that stalls, or that asks for something the \
+transcript already gave it, is a "fail": it used a question to avoid the task. An agent that \
+stopped short of a step it could have completed without an answer is graded on what it left \
+undone, like any other incomplete run.
 
 Answer with a single JSON object and nothing else:
 {"verdict": "pass" | "fail" | "borderline", "rationale": "<2-4 sentences citing specific \

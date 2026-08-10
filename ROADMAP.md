@@ -40,15 +40,35 @@ Measure the judge against the humans before trusting it.
 - [x] Per-annotator comparison (the judge scored against each rater on exactly the items both
       rated, so judge and human numbers sit on the same sample) and `--annotator` scoping, so a
       re-labeled round is reported on its own while the first round is kept as-is
-- [ ] Position-bias analysis (does verdict flip when candidate order is swapped?)
-- [ ] Verbosity-bias analysis (does the judge favor longer outputs at equal quality?)
-- [ ] Self-preference analysis (does the judge favor outputs from its own model family?)
-- [ ] Rubric versioning activated, with calibration reports tied to a rubric version
+- [ ] Order-sensitivity probe: does the verdict move when the prompt's context sections are
+      permuted but their content held byte-identical? (The pointwise analogue of position bias —
+      this judge grades one trajectory at a time, so there is no candidate pair to swap.)
+- [ ] Length-sensitivity probe: does the verdict move under an append-only padding ladder, beyond
+      what the rubric already licenses?
+- [ ] Judge test-retest reliability, reported as a result in its own right rather than as a
+      nuisance parameter — the noise floor every probe above is measured against
+- [ ] Stated power on every probe: minimum detectable effect, movers observed against movers
+      required, and an explicit `power_limited` flag so "inconclusive" is never mistaken for
+      "unbiased"
+- [ ] Per-criterion agreement: a structured rubric the judge and the annotators both fill in, so
+      a disagreement can be localised to *reading the run differently* versus *mapping the same
+      reading differently*
+- [ ] Rubric versioning activated, with calibration reports tied to a rubric version and a
+      warning when one report spans two of them
+- [ ] ~~Self-preference analysis~~ — moved to M4. It needs a difference-in-differences estimator
+      (the naive form measures judge leniency) and two judge families crossed over two agent
+      families; this database has one judge and 27 llama trajectories against 2 others.
 
 ## M4 — Distilled judge (planned)
 
 A small local judge, cheap enough to run on every PR.
 
+- [ ] Self-preference analysis (moved from M3): does a judge score trajectories from its own
+      model family higher than the rest of the panel does? Needs a difference-in-differences
+      contrast against the whole panel — the naive "own-family mean minus others' mean" is
+      positive for any judge that is merely generous — plus agent trajectories and judges from at
+      least two families. The provider offers llama, gpt-oss, and qwen instruct models, all
+      verified to tool-call, so this is data collection rather than a feasibility question.
 - [ ] Training-set builder that exports accumulated judgments in a fine-tuning format
 - [ ] Fine-tuned ~4B open model that matches the frontier judge within a stated kappa margin on
       a held-out golden set
