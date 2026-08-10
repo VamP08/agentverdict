@@ -128,9 +128,33 @@ class GroqChatClient:
                     time.sleep(min(2**attempt, 8))
                     continue
                 raise JudgeClientError(last_error) from exc
-            if response.status_code in self.RETRY_STATUS and attempt < self.MAX_ATTEMPTS:
-                time.sleep(_retry_delay(response, attempt))
-                continue
+            if response.status_code in self.RETRY_STATUS and _server_forbids_retry(response):
+                # The server can say the request will not succeed on a retry -- a daily
+                # token budget rather than a momentary burst. Three more attempts spread
+                # over a minute change nothing except how long the caller waits to find out.
+                raise JudgeClientError(
+                    f"Groq API error {response.status_code} (server advised against retrying): "
+                    f"{response.text[:300]}"
+                )
+            if response.status_code in self.RETRY_STATUS:
+                requested = _requested_delay(response)
+                throttled = requested is not None and requested > MAX_RETRY_DELAY_S
+                if throttled:
+                    # Name the cause. A caller told to come back in five minutes is being
+                    # rate limited, not served slowly, and "Groq API error 429" does not
+                    # tell them to slow the suite down or raise the account's ceiling.
+                    last_error = (
+                        f"rate limited by the server ({response.status_code}); it asked for "
+                        f"{requested:.0f}s and this client waits at most "
+                        f"{MAX_RETRY_DELAY_S:.0f}s per attempt"
+                    )
+                else:
+                    last_error = f"retryable status {response.status_code}"
+                if attempt < self.MAX_ATTEMPTS:
+                    time.sleep(_retry_delay(response, attempt))
+                    continue
+                if throttled:
+                    raise JudgeClientError(last_error)
             if response.status_code != 200:
                 raise JudgeClientError(
                     f"Groq API error {response.status_code}: {response.text[:300]}"
@@ -189,11 +213,42 @@ def _parse_tool_calls(raw: Any) -> list[ToolCall]:
     return calls
 
 
-def _retry_delay(response: httpx.Response, attempt: int) -> float:
+#: Longest wait this client will honor from a ``retry-after`` header, in seconds.
+#:
+#: The server is allowed to ask for any delay it likes. Groq answers a tokens-per-minute
+#: squeeze with a wait long enough to clear the window, and a suite that makes hundreds of
+#: calls -- an eval sweep, a bias probe -- will meet one. Sleeping for exactly as long as
+#: asked is indistinguishable from a hang: no output, no error, a process that looks alive
+#: and is doing nothing. Bounded instead, so an exhausted run reports a rate limit rather
+#: than stalling behind one.
+MAX_RETRY_DELAY_S = 30.0
+
+
+def _server_forbids_retry(response: httpx.Response) -> bool:
+    """True when the server sent ``x-should-retry: false``.
+
+    Groq sets it on a rate limit that a retry cannot clear -- a per-day token budget, as
+    opposed to the per-minute window a short back-off does clear. Taking the server at its
+    word turns four futile attempts into one immediate, accurate error.
+    """
+    return response.headers.get("x-should-retry", "").strip().lower() == "false"
+
+
+def _requested_delay(response: httpx.Response) -> float | None:
+    """The server's own ``retry-after``, in seconds, or None when it did not say."""
     header = response.headers.get("retry-after")
-    if header is not None:
-        try:
-            return max(float(header), 0.0)
-        except ValueError:
-            pass
+    if header is None:
+        return None
+    try:
+        return max(float(header), 0.0)
+    except ValueError:
+        # Retry-After also permits an HTTP date. Falling back to the exponential
+        # schedule is better than parsing dates against an unsynchronised clock.
+        return None
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    requested = _requested_delay(response)
+    if requested is not None:
+        return min(requested, MAX_RETRY_DELAY_S)
     return float(min(2**attempt, 8))

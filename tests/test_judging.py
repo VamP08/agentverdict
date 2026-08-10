@@ -70,6 +70,53 @@ def test_chat_json_retries_on_429_then_succeeds() -> None:
     assert json.loads(result.content)["verdict"] == "pass"
 
 
+def test_chat_json_does_not_sleep_out_a_long_retry_after() -> None:
+    """A server that asks for five minutes must not turn the client into a hang.
+
+    Sleeping for exactly as long as asked is indistinguishable from a stall from the
+    outside: no output, no error, a process that looks alive. The wait is capped and the
+    exhausted run says it was rate limited.
+    """
+    from agentverdict.judging.client import MAX_RETRY_DELAY_S
+
+    slept: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"retry-after": "300"}, json={"error": "rate"})
+
+    with _make_client(handler) as client:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr("agentverdict.judging.client.time.sleep", slept.append)
+            with pytest.raises(JudgeClientError) as raised:
+                client.chat_json("test-model", MESSAGES)
+
+    assert slept, "the client should still back off"
+    assert max(slept) <= MAX_RETRY_DELAY_S
+    message = str(raised.value)
+    assert "rate limited" in message
+    assert "300s" in message  # the server's own figure, so the cause is not guesswork
+
+
+def test_chat_json_stops_immediately_when_the_server_forbids_retrying() -> None:
+    """A daily token budget is not a burst: retrying only delays the bad news."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            429,
+            headers={"retry-after": "374", "x-should-retry": "false"},
+            json={"error": {"message": "tokens per day (TPD): Limit 100000, Used 99290"}},
+        )
+
+    with _make_client(handler) as client:
+        with pytest.raises(JudgeClientError) as raised:
+            client.chat_json("test-model", MESSAGES)
+
+    assert calls["n"] == 1, "the server said a retry would not help"
+    assert "tokens per day" in str(raised.value)  # the operator needs the actual limit
+
+
 def test_chat_json_client_error_is_not_retried() -> None:
     calls = {"n": 0}
 
