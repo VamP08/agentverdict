@@ -1,0 +1,288 @@
+name: Eval gate
+
+# Blocks a pull request when it makes the agent measurably worse.
+#
+# What this job does, in order:
+#   1. Installs AgentVerdict and brings a database up to the current schema.
+#   2. Replays a slice of the task suite against the agent as this branch defines it,
+#      then has an LLM judge score every recorded run. That is the *candidate* run.
+#   3. Compares the candidate against a stored *baseline* run: one score per task
+#      (fail 0.0, borderline 0.5, pass 1.0), the per-task deltas bootstrapped by
+#      resampling tasks. The job fails only when the confidence interval for the mean
+#      delta lies entirely below zero.
+#   4. Writes the comparison into the job summary, so a reviewer reads the verdict in
+#      the pull request's Checks tab without opening any logs.
+#
+# Step 3 is the whole point: suite scores move a little between runs even when nothing
+# changed, so "the mean went down" is not evidence. Only a drop that survives resampling
+# the tasks blocks a merge; anything else is reported and waved through.
+#
+# Replay and judging both call a model, so this job needs an API key. Pull requests from
+# forks never receive repository secrets, and plenty of clones will never set one, so
+# every model-calling step below is skipped when the key is absent and the job still
+# succeeds with an explanation in its summary. A gate that shows a red cross on every
+# outside contribution gets switched off within a week, and a gate nobody trusts is worse
+# than no gate at all.
+
+on:
+  pull_request:
+    branches: [main]
+  # Manual runs are how a repository owner produces a baseline in the first place: run
+  # this workflow on main, then copy the candidate run id out of the job summary.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One gate run per branch. A quick series of pushes cancels its own predecessors
+  # rather than paying a model to grade code nobody is reviewing any more.
+  group: eval-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # --- Everything below is configured by the repository owner ------------------------
+  #
+  # GROQ_API_KEY (secret) — replay and judging both call Groq. Absent on fork pull
+  # requests and on any clone that has not set it; the job then skips to a "not
+  # configured" summary and passes. Read through `env` rather than `secrets` because
+  # GitHub does not expose the `secrets` context to step-level `if:` conditions.
+  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+  #
+  # AGENTVERDICT_DATABASE_URL (secret, optional) — a database that outlives the job,
+  # e.g. postgresql+psycopg://user:password@host:5432/agentverdict. A runner's disk is
+  # discarded when the job ends, so a baseline run recorded last week only still exists
+  # if the runs are stored somewhere shared. Without it this job falls back to a fresh
+  # SQLite file, which is enough to replay and judge but has no baseline to compare to.
+  # Deliberately staged through a differently named variable and exported further down
+  # only when it is non-empty: an empty AGENTVERDICT_DATABASE_URL would not fall back to
+  # the SQLite default, it would override it with nothing.
+  EVAL_DATABASE_URL: ${{ secrets.AGENTVERDICT_DATABASE_URL }}
+  #
+  # AGENTVERDICT_BASELINE_RUN_ID (repository *variable*, not a secret — it is an id, not
+  # a credential) — the eval run every pull request is measured against. Set it under
+  # Settings → Secrets and variables → Actions → Variables.
+  #
+  # To obtain one:
+  #   1. Point AGENTVERDICT_DATABASE_URL at the shared database, so the run persists.
+  #   2. Record a run on the branch you consider correct — either by running
+  #      `agentverdict eval --judge ci-gate --limit 6` locally against that database, or
+  #      by triggering this workflow manually (Run workflow) on main.
+  #   3. Take the full run id from this job's summary, which prints it on every run, and
+  #      paste it into the variable. The `agentverdict eval` console line shortens the id
+  #      to eight characters for reading, so copy it from the summary, not from the log.
+  #   4. Refresh it deliberately — whenever an intentional quality change is merged — so
+  #      the bar is a decision somebody made, not whatever ran last.
+  BASELINE_RUN_ID: ${{ vars.AGENTVERDICT_BASELINE_RUN_ID }}
+  #
+  # The baseline and the candidate have to be scored by the same judge, or their
+  # difference measures the two judges rather than the agent (the comparison refuses to
+  # run otherwise). That is why the judge is a constant here and not a per-run choice.
+  JUDGE_NAME: ci-gate
+  #
+  # Cost ceiling for a pull request: tasks replayed, and therefore trajectories judged.
+  # Each task costs one agent replay — a tool-calling loop, so a few model calls — plus a
+  # single judge call. Raise it for a tighter interval, since a bootstrap over six tasks
+  # resolves nothing smaller than a large regression, and note which way that errs: too
+  # few tasks makes the gate quiet, never trigger-happy.
+  TASK_LIMIT: "6"
+
+jobs:
+  eval-gate:
+    name: Regression gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # --- Unconfigured clones and fork pull requests stop here, successfully ---------
+      - name: Report a gate that has nothing to run with
+        if: env.GROQ_API_KEY == ''
+        run: |
+          {
+            echo '## Eval gate skipped'
+            echo
+            echo 'No `GROQ_API_KEY` secret was available to this run, so the eval suite was not'
+            echo 'replayed and no regression check happened.'
+            echo
+            echo 'This is expected for pull requests from forks: GitHub does not hand repository'
+            echo 'secrets to them. The job passes rather than failing, because a red cross that'
+            echo 'every outside contributor sees teaches people to ignore the gate.'
+            echo
+            echo 'Repository owners: add a `GROQ_API_KEY` secret to turn the gate on.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --- From here on, everything is guarded on the key being present ---------------
+      - uses: actions/checkout@v4
+        if: env.GROQ_API_KEY != ''
+
+      - uses: actions/setup-python@v5
+        if: env.GROQ_API_KEY != ''
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: env.GROQ_API_KEY != ''
+        run: pip install -e ".[dev]"
+
+      - name: Use the shared eval database
+        # Only exported when the secret is actually set, so an unset secret leaves the
+        # local SQLite default in place instead of blanking it.
+        if: env.GROQ_API_KEY != '' && env.EVAL_DATABASE_URL != ''
+        run: echo "AGENTVERDICT_DATABASE_URL=$EVAL_DATABASE_URL" >> "$GITHUB_ENV"
+
+      - name: Create or upgrade the database schema
+        if: env.GROQ_API_KEY != ''
+        run: agentverdict init-db
+
+      - name: Load the task suite
+        if: env.GROQ_API_KEY != ''
+        run: |
+          # The sample bundle carries the tasks the agent is replayed against. Import it
+          # only into an empty database: a shared database already holds the suite, and
+          # importing again would stack duplicate copies of every recorded trajectory.
+          task_count=$(agentverdict stats | awk '/^Tasks:/ {print $2}')
+          if [ "${task_count:-0}" -eq 0 ]; then
+            agentverdict import examples/sample_trajectories.jsonl
+          else
+            printf 'Database already holds %s tasks; skipping the sample import.\n' "$task_count"
+          fi
+
+      - name: Register the CI judge
+        if: env.GROQ_API_KEY != ''
+        run: |
+          # `judge add` refuses to overwrite an existing judge, which is correct on the
+          # command line and unhelpful here: a shared database keeps the judge between
+          # runs, so register it only when it is genuinely missing. The listing is read
+          # into a variable first — piping it into `grep -q` would let grep close the
+          # pipe early, and this shell runs with `pipefail`.
+          registered=$(agentverdict judge list)
+          if grep -q "^${JUDGE_NAME} " <<< "$registered"; then
+            printf 'Judge %s is already registered.\n' "$JUDGE_NAME"
+          else
+            agentverdict judge add "$JUDGE_NAME" --description 'Registered by the eval-gate workflow'
+          fi
+
+      - name: Replay and judge this branch
+        if: env.GROQ_API_KEY != ''
+        run: |
+          # Replays up to TASK_LIMIT tasks against the agent as this branch defines it,
+          # then judges exactly the trajectories it just recorded.
+          #
+          # --run-id-file is what makes the candidate unambiguous. The console summary
+          # shortens the run id to eight characters for reading, and the obvious
+          # workaround — query the database for the newest run under this judge — is
+          # wrong on exactly the setup this workflow recommends: a *shared* database,
+          # where two pull requests running at once would each pick up whichever run
+          # finished last. This gate would then measure the other branch.
+          agentverdict eval --judge "$JUDGE_NAME" --limit "$TASK_LIMIT" \
+            --run-id-file "$RUNNER_TEMP/candidate-run-id"
+
+          # Written only when a run was actually recorded, and cleared before the eval
+          # starts, so an empty or missing file means this job produced nothing to judge.
+          candidate_run_id=$(cat "$RUNNER_TEMP/candidate-run-id" 2>/dev/null || true)
+          if [ -z "$candidate_run_id" ]; then
+            echo 'The eval run did not reach the database, so there is nothing to compare.' >&2
+            exit 1
+          fi
+          printf 'Candidate eval run: %s\n' "$candidate_run_id"
+          echo "CANDIDATE_RUN_ID=$candidate_run_id" >> "$GITHUB_ENV"
+
+      - name: Compare against the baseline
+        if: env.GROQ_API_KEY != '' && env.BASELINE_RUN_ID != ''
+        run: |
+          # `compare` distinguishes three outcomes by exit status, and the summary below
+          # must not collapse them: 0 = ran and did not block, 1 = a regression was
+          # measured, 2 = the comparison could not be made at all (an id that does not
+          # resolve, two runs from different judges). Reporting a 2 as "the suite scored
+          # lower" would tell a contributor their change hurt quality when in fact
+          # nothing was ever measured.
+          status=0
+          agentverdict compare "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID" --fail-on-regression \
+            > "$RUNNER_TEMP/comparison.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/comparison.txt"
+
+          # How many tasks the verdict actually rests on. A comparison can exit 0 having
+          # compared nothing (the suite changed shape, every judge call errored), and
+          # "no blocking regression" would then describe a gate that never ran.
+          # `compare` touches no model, so asking again is free.
+          tasks_compared=$(
+            agentverdict compare "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID" --json 2>/dev/null \
+              | python -c 'import json,sys; print(json.load(sys.stdin)["tasks_compared"])' \
+              2>/dev/null || echo 0
+          )
+
+          {
+            echo '## Eval gate'
+            echo
+            printf 'Baseline `%s` vs candidate `%s`, both judged by `%s`.\n' \
+              "$BASELINE_RUN_ID" "$CANDIDATE_RUN_ID" "$JUDGE_NAME"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/comparison.txt"
+            echo '```'
+            echo
+            if [ "$status" -eq 2 ]; then
+              echo '**The gate could not run.** This is a configuration problem, not a quality'
+              echo 'problem: nothing about this pull request was measured. The usual causes are a'
+              echo '`AGENTVERDICT_BASELINE_RUN_ID` that does not resolve in the database this job'
+              echo 'reached — most often because `AGENTVERDICT_DATABASE_URL` is unset, so every'
+              echo 'run gets a fresh disposable SQLite file — or a baseline recorded by a'
+              echo 'different judge than the one this job used.'
+              echo
+              echo 'It also fires when this branch edits the judge prompt: the baseline was'
+              echo 'graded by the old rubric, so the two runs are not on one scale. That is a'
+              echo 'legitimate change — merge it, then record a fresh baseline under the new'
+              echo 'prompt. The gate cannot grade a change to itself.'
+              echo
+              echo 'The job fails so a repository owner sees it. Do not read it as a verdict on'
+              echo 'the change.'
+            elif [ "$status" -eq 1 ]; then
+              echo '**Merge blocked.** The suite scored lower than the baseline, and the drop'
+              echo 'survived resampling the tasks — so it is unlikely to be luck. Read the'
+              echo 'per-task deltas above: the tasks that lost the most points are where this'
+              echo 'change hurt.'
+              echo
+              printf 'A gate is only as good as the judge behind it: `agentverdict calibrate %s`\n' \
+                "$JUDGE_NAME"
+              echo 'is the honest first thing to check if you think the judge, not the agent, is'
+              echo 'what went wrong here.'
+            elif [ "${tasks_compared:-0}" -eq 0 ]; then
+              echo '**Nothing was checked.** The comparison ran but shared no task with the'
+              echo 'baseline, so no verdict was reached and this pull request passed unexamined.'
+              echo 'Either the suite changed shape since the baseline was recorded, or every'
+              echo 'judge call in one of the runs failed. Refresh the baseline from a branch you'
+              echo 'are happy with, and treat this green check as absence of evidence.'
+            else
+              printf 'No blocking regression, over %s shared task(s). Either the suite held its\n' \
+                "$tasks_compared"
+              echo 'score, or it moved by less than the noise of which tasks happen to be in it.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$status"
+
+      - name: Explain a missing baseline
+        # Nothing to compare against yet. Report the run that was just recorded and how
+        # to promote it, rather than failing a pull request over configuration the author
+        # of that pull request cannot supply.
+        if: env.GROQ_API_KEY != '' && env.BASELINE_RUN_ID == ''
+        run: |
+          {
+            echo '## Eval gate: no baseline configured'
+            echo
+            echo 'The suite was replayed and judged, but no run was compared against it, so'
+            echo 'nothing was gated. The candidate run recorded by this job is:'
+            echo
+            printf '    %s\n' "$CANDIDATE_RUN_ID"
+            echo
+            echo 'To turn the gate on, set that id as the `AGENTVERDICT_BASELINE_RUN_ID`'
+            echo 'repository variable (Settings → Secrets and variables → Actions → Variables),'
+            echo 'having first pointed the `AGENTVERDICT_DATABASE_URL` secret at a database that'
+            echo 'outlives this job — otherwise the run is discarded with the runner and the id'
+            echo 'will not resolve on the next pull request.'
+            echo
+            echo 'Promote a run that was recorded from a branch you are happy with: every future'
+            echo 'pull request is measured against it.'
+          } >> "$GITHUB_STEP_SUMMARY"

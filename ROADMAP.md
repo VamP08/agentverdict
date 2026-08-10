@@ -55,14 +55,14 @@ A small local judge, cheap enough to run on every PR.
 - [ ] Local serving path so evals run without external API calls
 - [ ] Model card and weights published to the Hugging Face Hub
 
-## M5 — CI integration (planned)
+## M5 — CI integration (in progress)
 
 Merge gating on statistically sound evidence.
 
-- [ ] GitHub Action that runs an eval suite on pull requests and posts a results summary
+- [x] GitHub Action that runs an eval suite on pull requests and posts a results summary
 - [ ] Cost-bounded suites: hard token/latency budgets per run
-- [ ] Bootstrapped confidence intervals on score deltas between base and PR
-- [ ] Merge gate that blocks only on statistically significant regressions, with a clear
+- [x] Bootstrapped confidence intervals on score deltas between base and PR
+- [x] Merge gate that blocks only on statistically significant regressions, with a clear
       pass/fail annotation on the PR
 
 ## M6 — Leaderboard and online loop (planned)

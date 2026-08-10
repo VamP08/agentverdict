@@ -1,17 +1,19 @@
-"""Typer CLI: init-db, import, export, stats, serve, judge, replay, eval, calibrate.
+"""Typer CLI: init-db, import, export, stats, serve, judge, replay, eval, calibrate, compare.
 
 Schema creation goes through Alembic (``agentverdict.migrate``) so upgrades of an
 existing database work; ``db.init_db()`` remains the fast create_all path for tests.
 
 Heavy or optional machinery — alembic, uvicorn, the agents package, the judging
 package — is imported inside the command bodies so plain data commands start fast
-and work without a model API key. ``calibrate`` is one of those key-free commands:
-it only reads verdicts that are already stored.
+and work without a model API key. ``calibrate`` and ``compare`` are two of those
+key-free commands: they only read rows that are already stored, which is what
+makes them safe to run inside a CI gate.
 """
 
 from __future__ import annotations
 
 import sys
+import textwrap
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC
@@ -25,7 +27,7 @@ from sqlalchemy.orm import Session
 from agentverdict.db import get_session_factory
 from agentverdict.importer import compute_stats, export_jsonl, import_jsonl
 from agentverdict.models import EvalRun, Judge, JudgeVerdict, Task, Trajectory
-from agentverdict.schemas import AgreementRead, CalibrationReport, ReplayReport
+from agentverdict.schemas import AgreementRead, CalibrationReport, ReplayReport, RunComparison
 
 if TYPE_CHECKING:  # import-time cost avoided; only needed for annotations
     from agentverdict.agents.base import AgentAdapter
@@ -39,6 +41,19 @@ _DISAGREEMENT_LIMIT = 10
 _RATIONALE_WIDTH = 88
 #: Widest task key printed in full before it is trimmed, so the columns stay aligned.
 _TASK_KEY_WIDTH = 36
+#: Exit codes for ``compare``. CI has to tell these apart: 1 means a regression was
+#: measured and the merge should stop; 2 means the comparison could not be made at
+#: all (an id that does not resolve, two runs from different judges). Collapsing
+#: them into one nonzero code makes a missing baseline indistinguishable from a
+#: broken agent, and the pull request gets told its quality dropped when nobody
+#: measured anything.
+EXIT_REGRESSION = 1
+EXIT_CANNOT_COMPARE = 2
+
+#: Task rows printed by ``compare``; ``--json`` always carries every row.
+_TASK_DELTA_LIMIT = 15
+#: Width the excluded-task name lists wrap to, so a large suite stays readable.
+_EXCLUDED_WIDTH = 88
 
 app = typer.Typer(
     name="agentverdict",
@@ -93,6 +108,27 @@ def _require_eval_run(session: Session, judge: Judge, eval_run_id: str) -> EvalR
             err=True,
         )
         raise typer.Exit(code=1)
+    return run
+
+
+def _require_run(session: Session, eval_run_id: str, role: str) -> EvalRun:
+    """Look up an eval run by id alone, exiting when the id is unknown.
+
+    Unlike ``_require_eval_run`` this does not tie the run to a named judge:
+    ``compare`` is handed two ids and takes the judge from the runs themselves.
+    Whether the two runs share a judge is the comparison's decision, not the
+    lookup's — a gate that quietly compared verdicts from two different judges
+    would be measuring the judges, not the agent.
+    """
+    run = session.get(EvalRun, eval_run_id)
+    if run is None:
+        typer.echo(
+            f"No eval run with id '{eval_run_id}' (the {role} run)."
+            " Run summaries print a shortened id; compare needs the full one.",
+            err=True,
+        )
+        # Not a regression: nothing was measured. See EXIT_CANNOT_COMPARE.
+        raise typer.Exit(code=EXIT_CANNOT_COMPARE)
     return run
 
 
@@ -182,6 +218,11 @@ def _fmt_stat(value: float | None, digits: int = 3) -> str:
 
 def _fmt_pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1%}"
+
+
+def _fmt_delta(value: float | None, digits: int = 3) -> str:
+    """Format a change with an explicit sign: "-0.075" and "+0.075" must not look alike."""
+    return "n/a" if value is None else f"{value:+.{digits}f}"
 
 
 def _fmt_ci(low: float | None, high: float | None) -> str:
@@ -503,6 +544,189 @@ def _print_calibration_report(report: CalibrationReport) -> None:
     _print_calibration_disagreements(report)
 
 
+def _print_comparison_header(comparison: RunComparison) -> None:
+    typer.echo(
+        f"Comparison: base {comparison.base_run_id[:8]}"
+        f"  ->  candidate {comparison.candidate_run_id[:8]}"
+    )
+    # Naming the rubric alongside the judge: "same judge" is not the same claim as
+    # "same yardstick" once the prompt is editable, and these numbers only mean
+    # something relative to one.
+    rubric = comparison.judge_prompt_version or "unrecorded"
+    typer.echo(f"  judge      '{comparison.judge_name}'  (rubric {rubric})")
+    typer.echo(
+        f"  compared   {_count(comparison.tasks_compared, 'task', 'tasks')} present in both runs"
+    )
+    if comparison.input_tokens or comparison.output_tokens:
+        typer.echo(f"  tokens     {comparison.input_tokens} in / {comparison.output_tokens} out")
+    stamp = comparison.generated_at
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone(UTC)
+    typer.echo(f"  generated  {stamp:%Y-%m-%d %H:%M:%S} UTC")
+
+
+def _print_comparison_scores(comparison: RunComparison) -> None:
+    """The two suite scores and the change between them, with its interval."""
+    typer.echo("Suite score (mean over shared tasks; fail 0.0, borderline 0.5, pass 1.0)")
+    typer.echo(f"  base       {_fmt_stat(comparison.base_score):>7}")
+    typer.echo(f"  candidate  {_fmt_stat(comparison.candidate_score):>7}")
+    if comparison.tasks_compared >= 2:
+        typer.echo(
+            f"  delta      {_fmt_delta(comparison.delta):>7}"
+            f"   {_fmt_ci(comparison.delta_ci_low, comparison.delta_ci_high)}"
+        )
+        return
+    # A single task cannot be resampled, so there is no interval to show. Saying
+    # that here beats printing "CI n/a" and leaving the reader to guess why.
+    typer.echo(f"  delta      {_fmt_delta(comparison.delta):>7}   (one task: not resampled)")
+
+
+def _print_comparison_errors(comparison: RunComparison) -> None:
+    """Disclose judge calls that failed, because their absence flatters the score."""
+    total = comparison.base_judge_errors + comparison.candidate_judge_errors
+    if not total:
+        return
+    typer.echo(
+        f"  judge errors  {comparison.base_judge_errors} in base,"
+        f" {comparison.candidate_judge_errors} in candidate - excluded from the scores"
+    )
+    typer.echo(
+        "  A failed call is not a failed run, so it is not scored as one. But the calls"
+    )
+    typer.echo(
+        "  that fail are the long, hard transcripts, so the scores above read high."
+    )
+
+
+def _print_comparison_gate(comparison: RunComparison, *, fail_on_regression: bool) -> None:
+    """Say exactly what this result does to a merge, and what the flag changed."""
+    if comparison.blocks_merge:
+        if fail_on_regression:
+            typer.echo("  Gate: FAILED - this command exits 1, which is what blocks the merge.")
+        else:
+            typer.echo("  Gate: reporting only. Pass --fail-on-regression to make CI fail here.")
+        return
+    if fail_on_regression:
+        typer.echo("  Gate: passed - only a regression exits 1, so nothing is blocked.")
+    else:
+        typer.echo("  Gate: not enabled. Pass --fail-on-regression to block merges on this.")
+
+
+def _print_comparison_too_small(comparison: RunComparison, *, fail_on_regression: bool) -> None:
+    """Explain the missing verdict instead of printing an interval of "n/a".
+
+    Fewer than two shared tasks is not a quiet pass and not a quiet failure: the
+    gate never ran. A reader who sees an empty interval next to a green exit code
+    will read it as "no regression found", which is the one conclusion the data
+    cannot support.
+    """
+    typer.echo("Outcome: no gate decision - the shared suite is too small to resample.")
+    if comparison.tasks_compared == 0:
+        typer.echo("  The two runs have no task in common, so there is nothing to compare.")
+    else:
+        typer.echo("  Only one task appears in both runs. The gate works by resampling tasks,")
+        typer.echo("  and a single task resamples to itself every time, so there is no interval")
+        typer.echo("  and no way to separate a real change from noise.")
+    typer.echo("  Nothing was blocked and nothing was cleared - this is not a passing gate.")
+    typer.echo("  Judge at least two of the same tasks in both runs, then compare again.")
+    if fail_on_regression:
+        typer.echo("  --fail-on-regression exits 0 here: there is no evidence to block on.")
+
+
+def _print_comparison_outcome(comparison: RunComparison, *, fail_on_regression: bool) -> None:
+    """State the result in words — the numbers above do not interpret themselves.
+
+    ``comparison.summary`` is deliberately not echoed: it restates the scores and
+    the interval already printed above, and these lines spend their space on what
+    those numbers mean for the merge instead. ``--json`` carries the summary for
+    the pull-request comment that wants one sentence.
+    """
+    if comparison.tasks_compared < 2:
+        _print_comparison_too_small(comparison, fail_on_regression=fail_on_regression)
+        return
+
+    if comparison.outcome == "regression":
+        typer.echo("Outcome: regression - the candidate run scores worse than the baseline.")
+        typer.echo("  The whole 95% interval lies below zero, so the drop survives resampling")
+        typer.echo("  the tasks: it is larger than this suite's own run-to-run noise.")
+    elif comparison.outcome == "improvement":
+        typer.echo("Outcome: improvement - the candidate run scores better than the baseline.")
+        typer.echo("  The whole 95% interval lies above zero. An improvement never fails a gate.")
+    else:
+        typer.echo("Outcome: inconclusive - this change is indistinguishable from noise.")
+        typer.echo("  The 95% interval straddles zero, so resampling the tasks yields a drop as")
+        typer.echo("  readily as a gain: the suite cannot tell these two runs apart.")
+    _print_comparison_gate(comparison, fail_on_regression=fail_on_regression)
+
+
+def _print_task_deltas(comparison: RunComparison) -> None:
+    """Per-task movement, worst first — where the suite score actually moved."""
+    rows = sorted(comparison.task_deltas, key=lambda row: (row.delta, row.task_key))
+    if not rows:
+        return
+    shown = rows[:_TASK_DELTA_LIMIT]
+    if len(rows) > len(shown):
+        typer.echo(
+            f"Per-task change (worst first, showing {len(shown)} of {len(rows)};"
+            " --json prints all)"
+        )
+    else:
+        typer.echo(f"Per-task change (worst first, {_count(len(rows), 'task', 'tasks')})")
+    keys = [_trim(row.task_key, _TASK_KEY_WIDTH) for row in shown]
+    stub = max(len("task"), *(len(key) for key in keys))
+    typer.echo(f"  {'task':<{stub}}  {'base':>6}  {'cand':>6}  {'delta':>7}")
+    for row, key in zip(shown, keys, strict=True):
+        typer.echo(
+            f"  {key:<{stub}}  {_fmt_stat(row.base_score):>6}"
+            f"  {_fmt_stat(row.candidate_score):>6}  {_fmt_delta(row.delta):>7}"
+        )
+
+
+def _print_excluded_tasks(comparison: RunComparison) -> None:
+    """Name every task that only one run covered.
+
+    Pairing is by task, so a task missing from either side is dropped from the
+    statistics entirely. Left unsaid, that turns an edited suite into what looks
+    like an agent that changed: the tasks are therefore named, not counted.
+    """
+    total = len(comparison.base_only_tasks) + len(comparison.candidate_only_tasks)
+    typer.echo(
+        f"Excluded from the statistics: {_count(total, 'task', 'tasks')} present in one run only"
+    )
+    for label, names in (
+        ("base only", comparison.base_only_tasks),
+        ("candidate only", comparison.candidate_only_tasks),
+    ):
+        if not names:
+            continue
+        typer.echo(f"  {label} ({len(names)}):")
+        for line in textwrap.wrap(
+            ", ".join(sorted(names)),
+            width=_EXCLUDED_WIDTH,
+            initial_indent="    ",
+            subsequent_indent="    ",
+        ):
+            typer.echo(line)
+    typer.echo("  A suite that changed shape - rather than an agent that changed behavior - is")
+    typer.echo("  the likeliest explanation for a result that reads as surprising.")
+
+
+def _print_comparison(comparison: RunComparison, *, fail_on_regression: bool) -> None:
+    _print_comparison_header(comparison)
+    typer.echo("")
+    if comparison.tasks_compared:
+        _print_comparison_scores(comparison)
+        _print_comparison_errors(comparison)
+        typer.echo("")
+    _print_comparison_outcome(comparison, fail_on_regression=fail_on_regression)
+    if comparison.task_deltas:
+        typer.echo("")
+        _print_task_deltas(comparison)
+    if comparison.base_only_tasks or comparison.candidate_only_tasks:
+        typer.echo("")
+        _print_excluded_tasks(comparison)
+
+
 @app.command("init-db")
 def init_db_cmd() -> None:
     """Create or upgrade the database schema (safe to run repeatedly)."""
@@ -692,11 +916,29 @@ def eval_cmd(
         bool,
         typer.Option("--skip-replay", help="Judge existing trajectories instead of replaying."),
     ] = False,
+    run_id_file: Annotated[
+        Path | None,
+        typer.Option("--run-id-file", help="Write the new eval run's id to this file."),
+    ] = None,
 ) -> None:
-    """Replay tasks and judge exactly those runs: the end-to-end evaluation."""
+    """Replay tasks and judge exactly those runs: the end-to-end evaluation.
+
+    ``--run-id-file`` exists for automation. A caller that needs to act on the run it
+    just created -- a CI gate comparing it against a baseline, say -- would otherwise
+    have to go looking for "the newest run for this judge", which is a different run
+    the moment two jobs share a database. The file is written only when a run is
+    actually recorded, so its absence is a reliable signal that there is nothing to
+    compare rather than a stale id from an earlier attempt.
+    """
     from agentverdict.agents.replay import run_replay
     from agentverdict.judging.client import JudgeClientError
     from agentverdict.judging.runner import run_eval
+
+    # Clear any previous id up front. A caller reads this file to learn what this
+    # invocation produced; leaving yesterday's id in place when today's eval dies would
+    # hand it a run that has nothing to do with the code under test.
+    if run_id_file is not None:
+        run_id_file.unlink(missing_ok=True)
 
     try:
         with _open_session() as session:
@@ -745,6 +987,9 @@ def eval_cmd(
     except JudgeClientError as exc:
         typer.echo(f"Eval failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+
+    if run_id_file is not None:
+        run_id_file.write_text(f"{run.id}\n", encoding="utf-8")
 
     _print_eval_summary(run)
 
@@ -799,6 +1044,47 @@ def calibrate(
         typer.echo(report.model_dump_json(indent=2))
         return
     _print_calibration_report(report)
+
+
+@app.command()
+def compare(
+    base_run_id: Annotated[str, typer.Argument(help="Eval run id of the stored baseline.")],
+    candidate_run_id: Annotated[str, typer.Argument(help="Eval run id of the new run.")],
+    fail_on_regression: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-regression",
+            help="Exit 1 on a blocking regression — the bit CI keys on.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the comparison as JSON and nothing else.")
+    ] = False,
+) -> None:
+    """Compare a candidate eval run against a baseline and decide whether it regressed."""
+    from agentverdict.gating.compare import compare_runs
+
+    with _open_session() as session:
+        base = _require_run(session, base_run_id, "base")
+        candidate = _require_run(session, candidate_run_id, "candidate")
+        try:
+            comparison = compare_runs(session, base, candidate)
+        except ValueError as exc:
+            # Comparing runs scored by different judges measures the judges, not
+            # the agent. That refusal is a message worth reading, not a traceback.
+            typer.echo(f"Cannot compare these runs: {exc}", err=True)
+            raise typer.Exit(code=EXIT_CANNOT_COMPARE) from exc
+
+    if as_json:
+        typer.echo(comparison.model_dump_json(indent=2))
+    else:
+        _print_comparison(comparison, fail_on_regression=fail_on_regression)
+
+    # `blocks_merge` is the single bit the gate acts on, and it is set only for a
+    # regression — so an inconclusive or improved run can never fail CI, whatever
+    # direction the raw means happened to move.
+    if fail_on_regression and comparison.blocks_merge:
+        raise typer.Exit(code=EXIT_REGRESSION)
 
 
 @app.command()

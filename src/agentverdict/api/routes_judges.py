@@ -1,7 +1,8 @@
 """Read-only judge endpoints; judges are created via the CLI in M2.
 
-Calibration is served from here too: it is pure analysis over stored verdicts and
-human labels, so the endpoint never calls a model and needs no API key.
+Calibration (M3) and run comparison (M5) are served from here too: both are pure
+analysis over stored verdicts and human labels, so these endpoints never call a
+model and need no API key — which is what makes them safe to call from CI.
 """
 
 from typing import Annotated
@@ -12,8 +13,9 @@ from sqlalchemy.orm import Session
 
 from agentverdict.calibration.report import build_calibration_report
 from agentverdict.db import get_session
+from agentverdict.gating.compare import compare_runs
 from agentverdict.models import EvalRun, Judge, JudgeVerdict, Trajectory
-from agentverdict.schemas import CalibrationReport, JudgeRead, JudgeVerdictRead
+from agentverdict.schemas import CalibrationReport, JudgeRead, JudgeVerdictRead, RunComparison
 
 router = APIRouter(prefix="/api", tags=["judges"])
 
@@ -25,6 +27,18 @@ def _get_judge_or_404(judge_id: str, session: Session) -> Judge:
     if judge is None:
         raise HTTPException(status_code=404, detail=f"Judge {judge_id!r} not found")
     return judge
+
+
+def _get_eval_run_or_404(eval_run_id: str, session: Session) -> EvalRun:
+    """Resolve an eval run, or 404 naming the id that could not be found.
+
+    The id is echoed back because callers pass two of them to ``/comparisons``,
+    and "one of your run ids is wrong" is not an answer anybody can act on.
+    """
+    eval_run = session.get(EvalRun, eval_run_id)
+    if eval_run is None:
+        raise HTTPException(status_code=404, detail=f"Eval run {eval_run_id!r} not found")
+    return eval_run
 
 
 @router.get("/judges", response_model=list[JudgeRead])
@@ -65,9 +79,7 @@ def get_judge_calibration(
     """
     judge = _get_judge_or_404(judge_id, session)
     if eval_run_id is not None:
-        eval_run = session.get(EvalRun, eval_run_id)
-        if eval_run is None:
-            raise HTTPException(status_code=404, detail=f"Eval run {eval_run_id!r} not found")
+        eval_run = _get_eval_run_or_404(eval_run_id, session)
         if eval_run.judge_id != judge.id:
             raise HTTPException(
                 status_code=404,
@@ -80,6 +92,43 @@ def get_judge_calibration(
         task_key=task_key,
         annotators=annotator,
     )
+
+
+@router.get("/comparisons", response_model=RunComparison)
+def compare_eval_runs(
+    session: SessionDep,
+    base_run_id: Annotated[
+        str,
+        Query(description="Eval run holding the accepted quality bar, e.g. the last run on main."),
+    ],
+    candidate_run_id: Annotated[
+        str,
+        Query(description="Eval run under test, e.g. the one this pull request produced."),
+    ],
+) -> RunComparison:
+    """Ask whether a candidate eval run is worse than its baseline.
+
+    The answer is three-valued (`regression`, `improvement`, `inconclusive`) and
+    only `regression` sets `blocks_merge`; the per-task deltas and the bootstrap
+    interval behind that call come back with it, so a reader can check the verdict
+    instead of trusting it.
+
+    Both ids must name stored runs: an unknown id is a 404 rather than an empty
+    comparison, because a gate that answers "inconclusive" to a typo is a gate that
+    silently stops gating. Two runs scored by different judges — or by different
+    versions of the judge prompt, which is the same problem wearing the same
+    judge's name — are a 400: the scores would come off different measuring
+    instruments, so their difference would describe the grader rather than the
+    agent, and that is a request worth rejecting rather than a server fault.
+
+    Reads only stored verdicts, so it calls no model and costs nothing to poll.
+    """
+    base_run = _get_eval_run_or_404(base_run_id, session)
+    candidate_run = _get_eval_run_or_404(candidate_run_id, session)
+    try:
+        return compare_runs(session, base_run, candidate_run)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/trajectories/{trajectory_id}/verdicts", response_model=list[JudgeVerdictRead])

@@ -17,7 +17,7 @@ update it deliberately when a decision changes.
 | M2 | Eval runner: replay tasks against agents, LLM-as-judge scoring via Groq | **in progress** |
 | M3 | Calibration lab: judge-vs-human agreement (kappa), position/verbosity/self-preference bias stats | **in progress** |
 | M4 | Distilled 4B judge: fine-tune on accumulated judgments, serve locally, publish to HF Hub | planned |
-| M5 | CI integration: GitHub Action, cost-bounded suites, bootstrapped confidence intervals, merge gating | planned |
+| M5 | CI integration: GitHub Action, cost-bounded suites, bootstrapped confidence intervals, merge gating | **in progress** |
 | M6 | Public leaderboard + Langfuse online loop (production traces → new eval cases) | planned |
 
 ## M1 scope
@@ -104,6 +104,49 @@ Two halves; the judging half ships first, the replay half second.
    after M1, and `create_all` cannot add columns to existing tables. `agentverdict init-db` and
    `serve` therefore run `upgrade head`; `db.init_db()` (create_all) remains the fast path for
    tests. A test asserts `compare_metadata` finds no drift between migrations and the models.
+
+## M5 scope
+
+Part 1 (in progress) is the statistics and the gate; part 2 wires it into a packaged GitHub
+Action with cost ceilings.
+
+1. **Scoring a suite** — each verdict is worth `fail 0.0 / borderline 0.5 / pass 1.0`
+   (`stats.VERDICT_SCORES`), linear on the ordinal scale. A task's score is the mean over its
+   trajectories in that run, so `--repeats` sampling averages instead of double-counting; a run's
+   score is the mean over tasks, so a task with more replays does not get more say.
+2. **Pairing is by task, never by trajectory.** Replay creates fresh trajectories every time, so
+   the two runs share no trajectory ids. Tasks present in only one run are excluded from the
+   statistics and reported separately — silently dropping them would let a suite change look like
+   a quality change.
+3. **The test** (`gating/compare.py`) — take the per-task deltas, bootstrap their mean by
+   resampling **tasks** (`stats.bootstrap_mean_ci`), and read the interval:
+   entirely below zero → `regression`; entirely above → `improvement`; otherwise
+   `inconclusive`. Only `regression` sets `blocks_merge`. A suite too small to resample is
+   `inconclusive` by construction, which is the correct default: a gate that blocks on noise gets
+   switched off within a week, and a gate nobody trusts is worse than no gate.
+4. **The yardstick has to hold still.** The comparison refuses two runs from different judges,
+   and equally two runs graded by different versions of the judge prompt — `prompts.PROMPT_VERSION`,
+   a hash of the prompt text, stamped onto every `EvalRun`. Same judge, edited rubric is the same
+   error wearing the judge's name, and it arrives on exactly the pull request that edits the
+   rubric. Nullable, never backfilled: a run recorded before the column existed has an unknown
+   rubric, and inventing one would be a lie the gate then acts on.
+5. **Surfaces** — `agentverdict compare BASE CANDIDATE [--fail-on-regression --json]`;
+   `GET /api/comparisons?base=&candidate=`; and a workflow that replays, judges, and compares
+   against a stored baseline, posting the summary to the pull request.
+
+   Three exit codes, because CI has to tell them apart: **1** a regression was measured and the
+   merge should stop, **2** the comparison could not be made at all (unresolvable id, judge or
+   rubric mismatch), **0** everything else. Collapsing 2 into 1 makes the gate report a
+   configuration fault as a quality fault, in a message the contributor cannot act on. The
+   workflow branches on all three, and separately on `tasks_compared`, so a green check that
+   compared nothing does not read as a clean bill of health.
+
+   The candidate run id comes from `eval --run-id-file`, not from "the newest run for this
+   judge": on the shared database this design recommends, two concurrent pull requests would each
+   gate the other's run.
+
+Judge quality bounds all of this: a gate is only as trustworthy as the judge behind it, which is
+why calibration (M3) comes first and why the comparison records the judge it used.
 
 ## Rubric rules
 

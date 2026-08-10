@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from agentverdict.judging.client import GroqChatClient, JudgeClientError
-from agentverdict.judging.prompts import build_messages, render_transcript
+from agentverdict.judging.prompts import PROMPT_VERSION, build_messages, render_transcript
 from agentverdict.judging.runner import parse_decision, run_eval
 from agentverdict.models import HumanLabel, Judge, JudgeVerdict, Task, Trajectory
 
@@ -178,9 +178,40 @@ def test_run_eval_happy_path(
     assert run.verdict_counts == {"pass": 3}
     assert run.input_tokens == 300
     assert run.output_tokens == 60
+    # Provenance: which rubric produced these verdicts. The regression gate refuses to
+    # compare two runs stamped differently, so an unstamped run silently disables it.
+    assert run.judge_prompt_version == PROMPT_VERSION
     verdicts = list(session.scalars(select(JudgeVerdict)))
     assert len(verdicts) == 3
     assert all(v.verdict == "pass" and v.rationale for v in verdicts)
+
+
+def test_prompt_version_tracks_the_prompt_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Editing the rubric must move the fingerprint, or the gate compares across rubrics."""
+    from agentverdict.judging import prompts
+
+    monkeypatch.setattr(prompts, "SYSTEM_PROMPT", prompts.SYSTEM_PROMPT + "\nAlso be lenient.")
+    assert prompts._recompute_version() != PROMPT_VERSION
+
+
+def test_prompt_version_covers_every_section_the_judge_reads(
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+) -> None:
+    """The fingerprint's copy of the user-message headers must match the real ones.
+
+    ``_USER_PROMPT_SHAPE`` is a hand-written transcription of what ``build_messages``
+    emits. If someone renames a section there and not here, the rubric changes and the
+    fingerprint does not -- which is the exact failure the fingerprint exists to stop.
+    """
+    from agentverdict.judging.prompts import _USER_PROMPT_SHAPE
+
+    task = make_task(expected_outcome="The refund is issued.", tools_spec=[{"name": "refund"}])
+    messages = build_messages(task, make_trajectory(task=task))
+    user_message = messages[1]["content"]
+
+    for section in _USER_PROMPT_SHAPE.split("|"):
+        assert section in user_message
 
 
 def test_run_eval_retries_malformed_judge_output(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -39,6 +40,34 @@ CORRECTION_PROMPT = (
     'object of the form {"verdict": "pass" | "fail" | "borderline", "rationale": "...", '
     '"rubric_scores": {}}.'
 )
+
+
+#: Literal section headers and the closing instruction of the judge's user message.
+#: Kept beside the prompt text it fingerprints so that reordering or renaming a section
+#: registers as a rubric change, which it is -- the judge reads these.
+_USER_PROMPT_SHAPE = (
+    "# Task given to the agent|# Expected outcome|# Tools available to the agent|"
+    "# Transcript of the run|Judge this run now. Answer with the JSON object only."
+)
+
+def _recompute_version() -> str:
+    """Hash the current prompt text. Called once at import; re-callable for tests."""
+    material = "\n\x00".join((SYSTEM_PROMPT, CORRECTION_PROMPT, _USER_PROMPT_SHAPE))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+#: Fingerprint of the grader, so a changed rubric cannot masquerade as a changed agent.
+#:
+#: A regression gate compares two eval runs and attributes the difference to the code
+#: under review. That attribution is only sound if the yardstick held still. Editing one
+#: line of ``SYSTEM_PROMPT`` re-grades every transcript, and the resulting score movement
+#: looks exactly like an agent that got better or worse.
+#:
+#: Derived from the prompt text rather than hand-maintained, because a version constant
+#: somebody has to remember to bump is the one that goes stale on the commit where it
+#: mattered. Twelve hex characters: compared for equality and printed in summaries, never
+#: used as a security boundary.
+PROMPT_VERSION = _recompute_version()
 
 
 def _dumps(value: Any) -> str:

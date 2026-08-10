@@ -22,6 +22,13 @@ from dataclasses import dataclass
 #: weighted kappa meaningful; the unweighted statistics ignore it.
 VERDICT_ORDER: tuple[str, ...] = ("fail", "borderline", "pass")
 
+#: Numeric value of each verdict, for averaging a suite into a single score.
+#: Deliberately linear on the ordinal scale: a borderline is worth exactly half a
+#: pass, so turning two passes into two borderlines costs the same as turning one
+#: pass into one fail. Any other weighting would need a defence this project does
+#: not have the data to make.
+VERDICT_SCORES: dict[str, float] = {"fail": 0.0, "borderline": 0.5, "pass": 1.0}
+
 Pair = tuple[str, str]
 
 
@@ -244,6 +251,44 @@ def bootstrap_kappa_ci(
     return bootstrap_kappa(
         pairs, labels, iterations=iterations, confidence=confidence, seed=seed
     ).interval
+
+
+def bootstrap_mean_ci(
+    values: Sequence[float],
+    *,
+    iterations: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> BootstrapResult:
+    """Percentile bootstrap interval for the mean of ``values``.
+
+    The regression gate rests on this. Two eval runs over the same suite always
+    differ a little — the question is whether the difference is bigger than the
+    noise of which tasks happen to be in the suite. Resampling the per-task
+    deltas answers exactly that, and an interval straddling zero is the honest
+    way to say "this change is indistinguishable from noise" instead of blocking
+    a pull request over a rounding error.
+
+    Unlike kappa, a mean is defined for any non-empty sample, so every resample is
+    usable. ``None`` only when there is nothing (or a single item) to resample.
+    """
+    sample = list(values)
+    total = len(sample)
+    if total < 2 or not 0.0 < confidence < 1.0:
+        return BootstrapResult(interval=None, usable=0, iterations=iterations)
+    rng = random.Random(seed)
+    means = [
+        sum(sample[rng.randrange(total)] for _ in range(total)) / total
+        for _ in range(iterations)
+    ]
+    means.sort()
+    tail = (1.0 - confidence) / 2.0
+    last = iterations - 1
+    return BootstrapResult(
+        interval=(means[int(tail * last)], means[min(last, int(round((1.0 - tail) * last)))]),
+        usable=iterations,
+        iterations=iterations,
+    )
 
 
 def per_class_metrics(

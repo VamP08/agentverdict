@@ -300,6 +300,71 @@ class CalibrationReport(BaseModel):
     disagreements_total: int = 0  # before `disagreements` was truncated for display
 
 
+# --- Regression gating (M5) --------------------------------------------------
+
+
+class TaskScoreDelta(BaseModel):
+    """One task's mean score in each run, and the change between them."""
+
+    task_key: str
+    base_score: float
+    candidate_score: float
+    delta: float
+    base_trajectories: int
+    candidate_trajectories: int
+
+
+class RunComparison(BaseModel):
+    """Whether a candidate eval run is worse than its baseline, and by how much.
+
+    The verdict is deliberately three-valued. A suite score always moves a little
+    between runs, so "the mean went down" is not evidence of anything; only an
+    interval lying entirely below zero says the drop survives resampling the
+    tasks. Anything else is `inconclusive`, which must not block a merge.
+    """
+
+    base_run_id: str
+    candidate_run_id: str
+    judge_id: str
+    judge_name: str
+    #: Fingerprint of the judge prompt both runs were graded with. Identical by
+    #: construction — the comparison refuses to run across two versions of it — so one
+    #: field, not two. None for runs recorded before the version was tracked, which is
+    #: the one case where the rubric behind these numbers is genuinely unknown.
+    judge_prompt_version: str | None = None
+
+    tasks_compared: int
+    base_score: float | None = None  # mean over compared tasks, 0.0-1.0
+    candidate_score: float | None = None
+    delta: float | None = None
+    delta_ci_low: float | None = None
+    delta_ci_high: float | None = None
+
+    #: "regression" (interval entirely below zero), "improvement" (entirely
+    #: above), or "inconclusive" (straddles zero, or too little data to resample).
+    outcome: Literal["regression", "improvement", "inconclusive"] = "inconclusive"
+    #: True only for "regression" — the single bit a CI gate acts on.
+    blocks_merge: bool = False
+    summary: str = ""
+
+    base_only_tasks: list[str] = Field(default_factory=list)
+    candidate_only_tasks: list[str] = Field(default_factory=list)
+    task_deltas: list[TaskScoreDelta] = Field(default_factory=list)
+
+    # Verdict rows where the judge call failed. Counting a failed call as `fail`
+    # would turn a rate limit into a regression, so they are excluded from the
+    # scores — but silently excluding them biases the result upward exactly when
+    # it matters, because the calls that fail are the long, hard transcripts. A
+    # run that errored on its worst tasks scores better than it deserves, so the
+    # counts travel with the comparison and every surface reports them.
+    base_judge_errors: int = 0
+    candidate_judge_errors: int = 0
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    generated_at: datetime
+
+
 # --- Replay (M2) -------------------------------------------------------------
 
 

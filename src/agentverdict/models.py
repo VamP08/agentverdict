@@ -185,6 +185,11 @@ class EvalRun(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     judge_id: Mapped[str] = mapped_column(ForeignKey("judges.id"), index=True)
     task_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Fingerprint of the judge prompt this run was graded with (judging.prompts
+    # .PROMPT_VERSION). Nullable because runs recorded before the column existed cannot
+    # be attributed to a version after the fact, and inventing one for them would be a
+    # lie the regression gate then trusts.
+    judge_prompt_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="running")  # running|completed|failed
     trajectory_count: Mapped[int] = mapped_column(Integer, default=0)
     error_count: Mapped[int] = mapped_column(Integer, default=0)

@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from agentverdict.judging.client import ChatResult, GroqChatClient, JudgeClientError
-from agentverdict.judging.prompts import CORRECTION_PROMPT, build_messages
+from agentverdict.judging.prompts import CORRECTION_PROMPT, PROMPT_VERSION, build_messages
 from agentverdict.models import EvalRun, HumanLabel, Judge, JudgeVerdict, Task, Trajectory, utcnow
 from agentverdict.schemas import JudgeDecision
 
@@ -105,7 +105,12 @@ def run_eval(
         stmt = stmt.limit(limit)
     trajectories = list(session.scalars(stmt))
 
-    run = EvalRun(judge=judge, task_key=task_key, status="running")
+    # Stamped at creation, not at completion: the prompt in force when the grading
+    # started is the one the verdicts were produced under, and a run that dies partway
+    # still has to be attributable to a grader.
+    run = EvalRun(
+        judge=judge, task_key=task_key, status="running", judge_prompt_version=PROMPT_VERSION
+    )
     session.add(run)
     session.flush()
 

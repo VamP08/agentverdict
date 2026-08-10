@@ -44,8 +44,9 @@ from the accumulated judgments, and the calibrated judge gates pull requests in 
 
 ## Current status
 
-**Milestone 1 — golden-dataset workbench** and **Milestone 2 — eval runner** are done, and
-**Milestone 3 part 1 — judge calibration** has landed. What works today:
+**Milestone 1 — golden-dataset workbench** and **Milestone 2 — eval runner** are done,
+**Milestone 3 part 1 — judge calibration** has landed, and **Milestone 5 part 1 — the
+regression gate** now turns those calibrated verdicts into a merge decision. What works today:
 
 - Trajectory store: tasks, multi-step trajectories, and human labels in SQLite or Postgres
 - JSONL import/export of trajectory bundles, with realistic sample data in `examples/`
@@ -62,12 +63,18 @@ from the accumulated judgments, and the calibrated judge gates pull requests in 
   per-annotator comparison that puts judge and humans on identical items, and a ranked
   drill-down of every disagreement — on the CLI, over the API, and as a `/calibration` page in
   the browser
-- CLI: `init-db`, `import`, `export`, `stats`, `serve`, `judge`, `replay`, `eval`, `calibrate`
+- Regression gate: `agentverdict compare` scores two eval runs, pairs them task by task,
+  bootstraps the per-task deltas, and answers `regression` / `improvement` / `inconclusive` —
+  blocking a merge only when the whole confidence interval sits below zero, on the CLI, over the
+  API, and from a pull-request workflow that posts the summary
+- CLI: `init-db`, `import`, `export`, `stats`, `serve`, `judge`, `replay`, `eval`, `calibrate`,
+  `compare`
 - REST API under `/api`, test suite, CI workflow, docker-compose for Postgres
 
 The human-labeled dataset stays the ground truth throughout: the judge is scored against it,
-never the other way round. Bias analysis (position, verbosity, self-preference), the distilled
-local judge, and the CI gate are later milestones; see [ROADMAP.md](ROADMAP.md).
+never the other way round, and the gate is only allowed to block on what that judge has been
+shown to measure. Bias analysis (position, verbosity, self-preference), the distilled local
+judge, and cost-bounded suites are later milestones; see [ROADMAP.md](ROADMAP.md).
 
 ## Quickstart
 
@@ -348,6 +355,143 @@ disagreement linking straight through to the trajectory.
 Until trajectories carry both a human label and a judge verdict there is nothing to pair up and
 every statistic is undefined. The report says so and names the two commands that fix it, rather
 than rendering zeros that look like findings.
+
+## Gating a pull request
+
+This is the command everything above builds towards. Someone opens a pull request that rewrites
+an agent's prompt, swaps its model, or reorders a tool spec. CI replays the eval suite, judges
+it, and compares the result against a stored baseline run:
+
+```bash
+agentverdict compare BASE CANDIDATE --fail-on-regression
+```
+
+`BASE` and `CANDIDATE` are eval-run ids — the baseline you keep for `main`, and the run CI just
+produced on the branch. The command exits 1 only when the suite got *demonstrably* worse. A
+change that lands within the noise exits 0 and the merge goes through. Without
+`--fail-on-regression` it always exits 0 and only prints, which is what you want locally or in a
+report-only job.
+
+There is a third exit code, and the distinction matters more than it looks: **2 means the
+comparison could not be made at all** — an id that does not resolve, two runs from different
+judges, two runs graded by different versions of the judge prompt. A gate that collapsed that
+into exit 1 would tell a contributor their change made the agent worse when nothing about their
+change was ever measured. Automation should branch on all three.
+
+Take the candidate id from `eval --run-id-file`, not from a query:
+
+```bash
+agentverdict eval --judge ci-gate --limit 6 --run-id-file candidate-run-id
+agentverdict compare "$BASE" "$(cat candidate-run-id)" --fail-on-regression
+```
+
+The obvious alternative — ask the database for the newest run under this judge — is wrong on
+exactly the setup this project recommends. Point two pull requests at one shared database and
+each picks up whichever run finished last, so each gates the other branch. The file is cleared
+before the eval starts and written only once a run exists, so an empty file means there is
+nothing to compare rather than a stale id from yesterday.
+
+Comparing calls no model and costs nothing: like calibration, it is arithmetic over verdicts
+already in the database. Only the replay and judging steps ahead of it spend tokens.
+
+### What gets compared
+
+Two eval runs, paired **by task**.
+
+Each verdict is worth `fail 0.0`, `borderline 0.5`, `pass 1.0` — linear on the ordinal scale, so
+turning one pass into a fail costs exactly as much as turning two passes into borderlines. A
+task's score is the mean over its trajectories in that run; the run's score is the mean over its
+tasks. Two levels of averaging, for a reason: `--repeats 3` samples a flaky task three times
+without handing it three votes in the total.
+
+Pairing is by task and never by trajectory, because replay records fresh trajectories every
+time — two runs share no trajectory ids at all, only task keys. Tasks that appear in only one of
+the runs are excluded from the statistics and listed separately (`base_only_tasks`,
+`candidate_only_tasks`). Quietly folding them in would let *adding a task* read as a quality
+change, which is exactly the kind of defect that discredits a gate.
+
+### Why a bootstrap instead of two numbers
+
+Run the same suite twice, change nothing, and the score moves. The agent samples, the judge
+hedges differently on transcripts that are genuinely contestable, and on a twelve-task suite a
+single verdict sliding from `pass` to `borderline` is worth four points. "Baseline 0.83,
+candidate 0.79, block the merge" is not a measurement — it is reading noise as signal, and it
+will fire on pull requests that changed nothing that matters.
+
+So the gate asks a different question: how much does this delta depend on *which tasks happen to
+be in the suite*? It takes the per-task deltas, resamples those tasks with replacement ten
+thousand times, recomputes the mean delta on each resample, and keeps the middle 95%. Then it
+reads the interval, and only the interval:
+
+| 95% interval on the mean delta | Outcome | Merge |
+|---|---|---|
+| entirely below zero | `regression` | blocked, exit 1 |
+| entirely above zero | `improvement` | allowed |
+| straddles zero, or too few tasks to resample | `inconclusive` | allowed |
+
+Only `regression` sets `blocks_merge`. Everything else is reported and lets the merge through —
+including the case where the mean visibly dropped but the interval still contains zero. That is
+the gate saying "this suite cannot tell", which is the honest answer rather than a cautious one.
+The resampling is seeded, so the same two runs always produce the same interval; a gate whose
+verdict changes when you re-run it is not a gate. Ten thousand resamples rather than the
+thousand used for reporting elsewhere, because this interval is not read, it is *thresholded* —
+the merge turns on whether its upper edge sits below zero, and near that edge the resampling
+noise in the edge is the entire decision. A fixed seed makes that noise reproducible without
+making it smaller.
+
+The permissive default is a design decision, not a shortcut. A gate that blocks on noise gets
+switched off: the second time it stops a correct change for no reason, someone adds
+`continue-on-error` or deletes the job, and from then on nothing is gating anything. A gate
+nobody trusts is worse than no gate at all, because it also carries the appearance of one. The
+cost of that choice is worth stating plainly — a small suite will not detect a small regression,
+and the fix is more tasks (or more repeats), never a looser threshold.
+
+### The gate is only as good as the judge behind it
+
+A blocking verdict is a judge's opinion with statistics wrapped around it. If that judge
+disagrees with your own engineers a third of the time, the interval is a precise summary of an
+unreliable instrument: the gate will block good changes and wave bad ones through with identical
+confidence. This is why calibration comes first in this project, and why a comparison records
+the judge it used. Both runs must come from the same judge — compare two runs scored by
+different judges and the delta measures the judges, not the agent.
+
+The same applies to the *rubric*, and that one is easier to miss because the judge keeps its
+name. Every eval run stores a fingerprint of the judge prompt it was graded with, and a
+comparison across two fingerprints is refused. The pull request that edits `judging/prompts.py`
+is precisely the pull request whose score movement is not about the agent: it re-grades every
+transcript, and the result looks exactly like a quality change. The fingerprint is derived from
+the prompt text rather than a version constant somebody has to remember to bump, because that
+constant goes stale on the one commit where it mattered. When it fires, merge the rubric change
+and record a fresh baseline under it — the gate cannot grade a change to itself.
+
+Read the kappa before turning `--fail-on-regression` on. A judge that cannot match your
+annotators has no business blocking their merges.
+
+### In CI
+
+The bundled workflow, `.github/workflows/eval-gate.yml`, runs the three steps on every pull
+request: replay the suite and judge it, compare that run against the stored baseline, and post
+the summary back to the pull request.
+
+The job fails on two things, and its summary always says which. A red check is either a measured
+regression — the suite got worse, not merely moved — or a gate that could not run at all, which
+is a configuration problem the repository owner needs to see and which says nothing about the
+change. The summary also distinguishes a green check that means "no blocking regression over six
+shared tasks" from one that means "the baseline shared no task with this run, so nothing was
+checked". That last case passes, because the usual cause is a suite that legitimately changed
+shape, but it is stated rather than reported as a clean bill of health.
+
+`--json` prints the whole comparison as a single object — outcome, interval, tokens spent, and
+every per-task delta — which is what a bot comment, a dashboard, or a notebook should read
+instead of parsing the printed table. The same figures are available over HTTP:
+
+```bash
+curl "http://127.0.0.1:8000/api/comparisons?base=BASE&candidate=CANDIDATE"
+```
+
+Keep the baseline deliberate: one eval run against `main`, its id recorded where the workflow can
+read it, refreshed when you actually intend to move the bar. A baseline that drifts from run to
+run turns the gate into a comparison between two arbitrary samples.
 
 ## Architecture
 
