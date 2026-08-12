@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from agentverdict.db import get_session
 from agentverdict.models import HumanLabel, Rubric, Trajectory
+from agentverdict.rubric import validate_scores
 from agentverdict.schemas import LabelCreate, LabelRead
 
 router = APIRouter(prefix="/api/trajectories", tags=["labels"])
@@ -38,6 +39,18 @@ def submit_label(trajectory_id: str, payload: LabelCreate, session: SessionDep) 
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Rubric {payload.rubric_id!r} not found",
         )
+    # A criterion nobody defined, or a 0.7 on a yes/no question, is refused rather than
+    # stored: either one is read back by the calibration report as an answer, the first as
+    # a column the judge was never asked to fill and the second as a category of its own in
+    # the confusion matrix. Omitted keys stay omitted -- absence is how a question that did
+    # not arise is recorded, and nothing here fills one in.
+    try:
+        scores = validate_scores(payload.rubric_scores)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
     label = session.scalar(
         select(HumanLabel).where(
             HumanLabel.trajectory_id == trajectory_id,
@@ -50,7 +63,7 @@ def submit_label(trajectory_id: str, payload: LabelCreate, session: SessionDep) 
             annotator=payload.annotator,
             verdict=payload.verdict,
             rubric_id=payload.rubric_id,
-            rubric_scores=payload.rubric_scores,
+            rubric_scores=scores,
             rationale=payload.rationale,
             time_spent_s=payload.time_spent_s,
         )
@@ -58,7 +71,7 @@ def submit_label(trajectory_id: str, payload: LabelCreate, session: SessionDep) 
     else:
         label.verdict = payload.verdict
         label.rubric_id = payload.rubric_id
-        label.rubric_scores = payload.rubric_scores
+        label.rubric_scores = scores
         label.rationale = payload.rationale
         label.time_spent_s = payload.time_spent_s
     session.flush()

@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from agentverdict.rubric import validate_scores
 
 StepType = Literal["user_message", "assistant_message", "tool_call", "tool_result", "system"]
 TrajectoryStatus = Literal["completed", "error", "truncated"]
@@ -118,6 +120,22 @@ class JudgeDecision(BaseModel):
     verdict: LabelVerdict
     rationale: str = Field(min_length=1)
     rubric_scores: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("rubric_scores")
+    @classmethod
+    def _scores_must_be_on_the_rubric(cls, scores: dict[str, float]) -> dict[str, float]:
+        """Refuse invented keys and off-scale values, so the runner asks the judge again.
+
+        A judge that names a criterion nobody defined has not answered this rubric, and
+        keeping the key quietly is worse than rejecting it: it would reach the calibration
+        report as a column with no human counterpart, be compared against the handful of
+        rows that happened to carry it, and still print a kappa. A rejected answer costs
+        one correction turn and says what was wrong.
+
+        An empty or partial object stays valid. Absence is how a question that did not
+        arise is recorded, and it is what round-one labels look like.
+        """
+        return validate_scores(scores)
 
 
 class JudgeCreate(BaseModel):
@@ -257,6 +275,28 @@ class HeldOutAnnotatorAgreement(PairUncertainty):
     cohens_kappa: float | None = None
 
 
+class CriterionAgreement(PairUncertainty):
+    """Judge against humans on one criterion, over the items both of them answered.
+
+    ``n`` counts only trajectories where **both** sides scored this key. A key missing on
+    either side is excluded and counted in ``CalibrationReport.criteria_unanswered``,
+    never coerced to 0.0: absence means the question did not arise, and scoring it as a
+    failure would report a consent violation on every run that never faced the question.
+
+    The marginals travel with the row because kappa degenerates on a criterion almost
+    everyone answers 1.0 — two raters agreeing 95% of the time can score near zero — and
+    the counts are what tell a reader which of those two situations they are looking at.
+    """
+
+    key: str
+    description: str
+    n: int
+    observed_agreement: float | None = None
+    cohens_kappa: float | None = None
+    judge_positive: int = 0  # times the judge answered 1.0
+    human_positive: int = 0
+
+
 class DisagreementRow(BaseModel):
     """One trajectory where the judge and the humans reached different verdicts."""
 
@@ -298,6 +338,19 @@ class CalibrationReport(BaseModel):
     human_baseline: list[HeldOutAnnotatorAgreement] = Field(default_factory=list)
     disagreements: list[DisagreementRow] = Field(default_factory=list)
     disagreements_total: int = 0  # before `disagreements` was truncated for display
+
+    criteria: list[CriterionAgreement] = Field(default_factory=list)
+    # Per key, trajectories dropped from that criterion's row because one side left it
+    # unanswered. Kept visible because it is the difference between the headline n and
+    # each criterion's own: a kappa computed on three items must not be read as one
+    # computed on all of them.
+    criteria_unanswered: dict[str, int] = Field(default_factory=dict)
+
+    # Trajectories where judge and humans answered every shared criterion identically and
+    # still reached different verdicts. That is the rubric's aggregation rule disagreeing
+    # with itself rather than the judge misreading the run — `order-status-01` is the case
+    # this whole structure exists to name — and it points at a different artifact to fix.
+    rule_disagreements: int = 0
 
 
 # --- Bias probes (M3 part 2) -------------------------------------------------

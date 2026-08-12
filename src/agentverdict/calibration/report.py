@@ -5,7 +5,7 @@ evidence. This module answers one question over rows already in the database:
 when the judge scored a trajectory the humans also scored, how often — and how
 badly — did it disagree with them?
 
-The report has four parts, each answering a different follow-up:
+The report has five parts, each answering a different follow-up:
 
 * **agreement** — the confusion matrix, raw agreement, Cohen's kappa with a
   bootstrap interval, and an ordinal weighted kappa. This is the headline.
@@ -33,6 +33,14 @@ The report has four parts, each answering a different follow-up:
   ways, worst first by ordinal distance (a pass/fail flip before a
   pass/borderline one) and carrying the judge's own rationale, so the failure
   mode can be read rather than guessed at. This is the actionable output.
+* **per-criterion agreement** — the same statistics computed separately for each
+  rubric criterion, over the trajectories where judge and humans both answered
+  it, and with them ``rule_disagreements``: the trajectories where the two sides
+  answered every shared criterion identically and still returned different
+  verdicts. A verdict token is a summary of a reading, and two raters can read a
+  run the same way and summarise it differently — this section separates those
+  cases from genuine misreadings, which is the difference between fixing the
+  judge and fixing the rubric.
 
 A report can also be scoped to a named set of annotators. Once a rubric ambiguity
 is written down, a second annotation round measures a *different* thing than the
@@ -49,7 +57,7 @@ it safe to put in a CI gate.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Container, Mapping, Sequence
+from collections.abc import Container, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
@@ -66,11 +74,13 @@ from agentverdict.calibration.stats import (
     observed_agreement,
 )
 from agentverdict.models import HumanLabel, Judge, JudgeVerdict, Task, Trajectory, utcnow
+from agentverdict.rubric import CRITERIA, CRITERIA_BY_KEY, SCORE_LABELS, score_label
 from agentverdict.schemas import (
     AgreementRead,
     AnnotatorPairAgreement,
     CalibrationReport,
     ClassMetricsRead,
+    CriterionAgreement,
     DisagreementRow,
     HeldOutAnnotatorAgreement,
     JudgeAnnotatorAgreement,
@@ -78,6 +88,11 @@ from agentverdict.schemas import (
 
 #: Position of each verdict on the ordinal scale, for distance arithmetic.
 _VERDICT_INDEX: dict[str, int] = {label: index for index, label in enumerate(VERDICT_ORDER)}
+
+#: The "yes" answer to a criterion, as an agreement label. Counting it on each side is
+#: what distinguishes a criterion two raters genuinely agree on from one they both
+#: answered the same way every time — where kappa is undefined and prints nothing.
+_POSITIVE_ANSWER = score_label(1.0)
 
 
 @dataclass(frozen=True)
@@ -87,6 +102,7 @@ class _JudgeCall:
     verdict: str
     rationale: str | None
     task_key: str
+    rubric_scores: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -99,11 +115,29 @@ class _ComparedItem:
     judge_verdict: str
     annotators: tuple[str, ...]
     judge_rationale: str | None
+    # ``key -> (human, judge)``, holding only the criteria both sides answered.
+    criterion_answers: Mapping[str, tuple[str, str]]
 
     @property
     def distance(self) -> int:
         """Steps apart on ``fail < borderline < pass``; 2 is a pass/fail flip."""
         return abs(_VERDICT_INDEX[self.human_verdict] - _VERDICT_INDEX[self.judge_verdict])
+
+
+def _majority(answers: Iterable[str]) -> str | None:
+    """The single most common answer, or ``None`` when there is none or the top two tie.
+
+    One implementation, because verdicts and criterion scores must break ties the same
+    way: a report that dropped a split panel from the headline while letting one
+    annotator's answer stand in for the panel on a criterion would be aggregating two
+    different ideas of what the humans said.
+    """
+    ranked = Counter(answers).most_common()
+    if not ranked:
+        return None
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return None
+    return ranked[0][0]
 
 
 def human_majority(labels: Sequence[HumanLabel]) -> str | None:
@@ -114,12 +148,7 @@ def human_majority(labels: Sequence[HumanLabel]) -> str | None:
     inventing one (by annotator order, say) would quietly bias the comparison.
     Such trajectories are excluded from the statistics and counted as ties.
     """
-    ranked = Counter(label.verdict for label in labels).most_common()
-    if not ranked:
-        return None
-    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
-        return None
-    return ranked[0][0]
+    return _majority(label.verdict for label in labels)
 
 
 def _to_agreement_read(stats: AgreementStats) -> AgreementRead:
@@ -172,6 +201,7 @@ def _latest_judge_calls(
             JudgeVerdict.trajectory_id,
             JudgeVerdict.verdict,
             JudgeVerdict.rationale,
+            JudgeVerdict.rubric_scores,
             Task.key,
         )
         .join(Trajectory, JudgeVerdict.trajectory_id == Trajectory.id)
@@ -186,12 +216,18 @@ def _latest_judge_calls(
 
     calls: dict[str, _JudgeCall] = {}
     errors = 0
-    for trajectory_id, verdict, rationale, key in session.execute(stmt):
+    for trajectory_id, verdict, rationale, scores, key in session.execute(stmt):
         if verdict is None:
             errors += 1
             continue
         # Rows arrive oldest first, so the last write per trajectory wins.
-        calls[trajectory_id] = _JudgeCall(verdict=verdict, rationale=rationale, task_key=key)
+        calls[trajectory_id] = _JudgeCall(
+            verdict=verdict,
+            rationale=rationale,
+            task_key=key,
+            # Verdicts recorded before the rubric was structured carry no scores at all.
+            rubric_scores=scores or {},
+        )
     return calls, errors
 
 
@@ -396,6 +432,145 @@ def _human_baseline(
     return rows
 
 
+def _answers(scores: Mapping[str, Any] | None) -> dict[str, str]:
+    """One stored ``rubric_scores`` blob as agreement labels, keeping only real answers.
+
+    A key outside :data:`~agentverdict.rubric.CRITERIA`, or a value outside the
+    criterion's permitted set, is dropped rather than repaired. Both are answers to a
+    question this rubric did not ask, and snapping 0.7 to the nearest permitted score
+    would invent an opinion nobody held; dropped, the criterion reads as unanswered,
+    which is what it is.
+    """
+    answers: dict[str, str] = {}
+    for key, value in (scores or {}).items():
+        criterion = CRITERIA_BY_KEY.get(key)
+        if criterion is not None and value in criterion.values:
+            answers[key] = score_label(value)
+    return answers
+
+
+def _human_criterion_answers(labels: Sequence[HumanLabel]) -> dict[str, str]:
+    """The panel's answer per criterion: a majority of the annotators who answered it.
+
+    Computed per key rather than per label, because a criterion two annotators answered
+    and a third skipped still has an answer behind it. Ties drop out under the same rule
+    that drops a tied verdict — a split panel holds no position for the judge to be
+    scored against, and picking a side by annotator order would settle the comparison
+    alphabetically. With two annotators every disagreement is a tie, so a criterion the
+    panel splits on leaves the judge unmeasured on precisely the item that was hardest
+    to call; the drop is counted in ``criteria_unanswered`` rather than hidden, because
+    a criterion's kappa is only readable next to how much of the sample reached it.
+    """
+    given: dict[str, list[str]] = defaultdict(list)
+    for label in labels:
+        for key, answer in _answers(label.rubric_scores).items():
+            given[key].append(answer)
+    majorities = {key: _majority(answers) for key, answers in given.items()}
+    return {key: answer for key, answer in majorities.items() if answer is not None}
+
+
+def _shared_criterion_answers(
+    labels: Sequence[HumanLabel], judge_scores: Mapping[str, Any] | None
+) -> dict[str, tuple[str, str]]:
+    """``key -> (human, judge)`` for the criteria both sides actually answered.
+
+    A key one side left out is excluded, never filled in with 0.0. 0.0 is an answer —
+    *the agent failed this* — and spending it on *the question did not arise* would book
+    a consent violation against every run that only looked something up, then report the
+    two raters as agreeing about it. Human first, matching the ``(reference,
+    comparison)`` order every statistic in this module takes; rubric order, so the rows
+    downstream read in the order the rulebook and the labeling form ask the questions.
+    """
+    human = _human_criterion_answers(labels)
+    judge = _answers(judge_scores)
+    return {
+        key: (human[key], judge[key])
+        for key in CRITERIA_BY_KEY
+        if key in human and key in judge
+    }
+
+
+def _criterion_agreement(
+    items: Sequence[_ComparedItem], *, iterations: int, seed: int
+) -> tuple[list[CriterionAgreement], dict[str, int]]:
+    """Judge-vs-human agreement per criterion, and what each criterion could not reach.
+
+    One row per criterion, including the ones nobody has answered yet: a row reading
+    ``n=0`` says the column is empty, whereas omitting it says the rubric has four
+    criteria. The statistics come from the same ``agreement_stats`` the verdicts use,
+    over the score labels instead of the verdict vocabulary — a kappa written separately
+    for scores would be a second set of decisions about degenerate raters, empty samples
+    and discarded resamples, and the two would drift apart on the first edit.
+
+    Every criterion is measured over the trajectories the headline is measured over, so
+    ``n + criteria_unanswered[key] == len(items)`` holds for each key and the difference
+    between the two numbers is always visible. Scoring a criterion on a wider set than
+    the verdicts would print two figures side by side that describe different item sets,
+    which is the error the per-rater rows further up exist to undo.
+    """
+    rows: list[CriterionAgreement] = []
+    unanswered: dict[str, int] = {}
+    for criterion in CRITERIA:
+        pairs = [
+            item.criterion_answers[criterion.key]
+            for item in items
+            if criterion.key in item.criterion_answers
+        ]
+        unanswered[criterion.key] = len(items) - len(pairs)
+        stats = agreement_stats(pairs, SCORE_LABELS, bootstrap_iterations=iterations, seed=seed)
+        low, high = stats.kappa_ci if stats.kappa_ci is not None else (None, None)
+        rows.append(
+            CriterionAgreement(
+                key=criterion.key,
+                description=criterion.description,
+                n=stats.n,
+                observed_agreement=stats.observed_agreement,
+                cohens_kappa=stats.cohens_kappa,
+                kappa_ci_low=low,
+                kappa_ci_high=high,
+                bootstrap_usable=stats.bootstrap_usable,
+                bootstrap_iterations=stats.bootstrap_iterations,
+                human_positive=sum(1 for human, _ in pairs if human == _POSITIVE_ANSWER),
+                judge_positive=sum(1 for _, judge in pairs if judge == _POSITIVE_ANSWER),
+            )
+        )
+    return rows, unanswered
+
+
+def _rule_disagreements(items: Sequence[_ComparedItem]) -> int:
+    """Verdict disagreements where both sides answered every shared criterion alike.
+
+    These are not judge errors. The judge read the run exactly as the annotators did —
+    same goal, same tools, same ending — and the two still landed on different verdicts,
+    which leaves one place for the difference to live: the rule that turns answers into
+    a verdict. ``order-status-01`` is the case that put this number on the report. The
+    judge's rationale agreed with both annotators about every fact of the run and it
+    still said ``borderline``, because the unfinished-conversation rule as then written
+    fired on an agent that had done what was asked.
+
+    So when this is a large share of ``disagreements_total``, the artifact to change is
+    the rubric — the rules in ``DESIGN.md`` and the prompt paragraph that mirrors them —
+    and not the model, the temperature or the examples. Re-prompting a judge that
+    already sees what you see moves nothing. Rewrite the rule, bump ``RUBRIC_VERSION``
+    and ``PROMPT_VERSION``, re-judge, and treat the earlier numbers as describing a
+    different rulebook. When this is near zero and disagreements are still high, the
+    opposite reading holds: the two sides are reading the runs differently, and the
+    judge is what needs the work.
+
+    A trajectory whose two sides share no answered criterion cannot be placed either way
+    and is not counted. With nothing in common, *they agreed on everything* is vacuously
+    true, and round one — labeled before the criteria existed — would otherwise report
+    every disagreement it contains as a rubric fault.
+    """
+    return sum(
+        1
+        for item in items
+        if item.human_verdict != item.judge_verdict
+        and item.criterion_answers
+        and all(human == judge for human, judge in item.criterion_answers.values())
+    )
+
+
 def build_calibration_report(
     session: Session,
     judge: Judge,
@@ -452,16 +627,16 @@ def build_calibration_report(
             continue
         if call.verdict not in _VERDICT_INDEX:
             continue
+        labels = labels_by_trajectory[trajectory_id]
         compared_items.append(
             _ComparedItem(
                 trajectory_id=trajectory_id,
                 task_key=call.task_key,
                 human_verdict=human_verdict,
                 judge_verdict=call.verdict,
-                annotators=tuple(
-                    sorted(label.annotator for label in labels_by_trajectory[trajectory_id])
-                ),
+                annotators=tuple(sorted(label.annotator for label in labels)),
                 judge_rationale=call.rationale,
+                criterion_answers=_shared_criterion_answers(labels, call.rubric_scores),
             )
         )
     # A stable order keeps the seeded bootstrap reproducible across runs.
@@ -489,6 +664,10 @@ def build_calibration_report(
         if item.human_verdict != item.judge_verdict
     ]
     disagreements.sort(key=lambda row: (-row.distance, row.task_key, row.trajectory_id))
+
+    criteria, criteria_unanswered = _criterion_agreement(
+        compared_items, iterations=bootstrap_iterations, seed=seed
+    )
 
     return CalibrationReport(
         judge_id=judge.id,
@@ -531,4 +710,7 @@ def build_calibration_report(
         ),
         disagreements=disagreements[: max(max_disagreements, 0)],
         disagreements_total=len(disagreements),
+        criteria=criteria,
+        criteria_unanswered=criteria_unanswered,
+        rule_disagreements=_rule_disagreements(compared_items),
     )

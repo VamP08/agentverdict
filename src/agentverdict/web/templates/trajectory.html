@@ -73,6 +73,34 @@
   {% endif %}
 </section>
 
+<style>
+  .criteria-grid {
+    display: grid;
+    grid-template-columns: minmax(14rem, 1fr) auto;
+    align-items: center;
+    gap: 0.45rem 1.25rem;
+    max-width: 46rem;
+  }
+  .criterion-question { font-size: 0.92rem; }
+  .criterion-hint { display: block; font-size: 0.8rem; color: #6b7686; }
+  .criteria-clear {
+    border: none;
+    background: none;
+    padding: 0;
+    margin-left: 0.5rem;
+    color: #3949ab;
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 400;
+    cursor: pointer;
+  }
+  .criteria-clear:hover { text-decoration: underline; }
+  @media (max-width: 40rem) {
+    .criteria-grid { grid-template-columns: 1fr; gap: 0.25rem 0; }
+    .criteria-grid .verdict-options { margin-bottom: 0.7rem; }
+  }
+</style>
+
 <section>
   <h2>Your label</h2>
   {% if form_error %}<p class="form-error">{{ form_error }}</p>{% endif %}
@@ -102,6 +130,29 @@
                    {% if form_verdict == 'borderline' %}checked{% endif %}>
             borderline <kbd>3</kbd>
           </label>
+        </div>
+      </fieldset>
+      <fieldset class="field" id="criteria">
+        <legend>
+          Criteria <span class="muted">(all optional)</span>
+          <button type="button" class="criteria-clear" id="clear-criteria">clear</button>
+        </legend>
+        <div class="criteria-grid">
+          {% for criterion in criteria %}
+          <div class="criterion-question">
+            <span id="ask-{{ criterion.key }}">{{ criterion.question }}</span>
+            {% if criterion.hint %}<span class="criterion-hint">{{ criterion.hint }}</span>{% endif %}
+          </div>
+          <div class="verdict-options" role="radiogroup" aria-labelledby="ask-{{ criterion.key }}">
+            {% for option in criterion.options %}
+            <label class="verdict-option">
+              <input type="radio" name="{{ criterion.field }}" value="{{ option.value }}"
+                     {% if option.checked %}checked{% endif %}>
+              {{ option.word }}
+            </label>
+            {% endfor %}
+          </div>
+          {% endfor %}
         </div>
       </fieldset>
       <div class="field">
@@ -150,6 +201,15 @@
   (function () {
     var form = document.getElementById("label-form");
     var verdictKeys = { "1": "pass", "2": "fail", "3": "borderline" };
+    var clearButton = document.getElementById("clear-criteria");
+    if (clearButton) {
+      // A radio group cannot be emptied by clicking, and every criterion is optional,
+      // so a mis-click would otherwise stick an answer nobody meant onto the label.
+      clearButton.addEventListener("click", function () {
+        var chosen = form.querySelectorAll("#criteria input[type=radio]:checked");
+        for (var i = 0; i < chosen.length; i++) { chosen[i].checked = false; }
+      });
+    }
     document.addEventListener("keydown", function (event) {
       if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
         event.preventDefault();
@@ -161,6 +221,10 @@
       var typing = el && (el.tagName === "TEXTAREA" ||
         (el.tagName === "INPUT" && el.type === "text"));
       if (typing) { return; }
+      // Inside the criteria the digits belong to nothing: taking them would move the
+      // verdict behind the annotator's back while they are answering a different
+      // question. Arrow keys already pick within a radio group.
+      if (el && el.closest && el.closest("#criteria")) { return; }
       var verdict = verdictKeys[event.key];
       if (verdict) {
         var radio = form.querySelector('input[name="verdict"][value="' + verdict + '"]');
