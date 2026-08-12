@@ -369,4 +369,369 @@
 </p>
 {% endif %}
 {% endif %}
+
+<h2>Bias probes</h2>
+<p class="muted">
+  Everything above asks how far this judge is from the people. A probe asks a question with no
+  people in it: re-judge the same trajectory under a prompt that differs in a way that should not
+  matter, and watch whether the verdict moves. The headline of each probe is the judge's own
+  test-retest noise &mdash; whether two byte-identical calls even agree &mdash; because no shift
+  underneath it means anything until that floor is known.
+</p>
+<p class="muted">
+  These panels read stored probe rows only, so opening this page never calls a model and never
+  starts a sweep. <code>agentverdict probe {{ report.judge_name }}</code> is what records one.
+</p>
+
+<div id="bias-probes" data-judge="{{ judge.id }}" data-judge-name="{{ report.judge_name }}">
+  <p class="muted">Loading stored probe runs&hellip;</p>
+</div>
+
+<noscript>
+  <div class="card empty-state">
+    <p>
+      This panel reads <code>/api/judges/{{ judge.id }}/bias</code> in the browser, which needs
+      JavaScript. The same report is available two other ways, both of them complete:
+    </p>
+    <ul class="fix-list">
+      <li>
+        <a href="/api/judges/{{ judge.id }}/bias?probe=order">order probe JSON</a> and
+        <a href="/api/judges/{{ judge.id }}/bias?probe=length">length probe JSON</a>
+      </li>
+      <li>
+        <code>agentverdict probe {{ report.judge_name }} --probe order</code> prints it laid out
+        for reading, and records a fresh run while it is at it.
+      </li>
+    </ul>
+  </div>
+</noscript>
+
+<script>
+(function () {
+  var host = document.getElementById("bias-probes");
+  if (!host) { return; }
+  var judgeId = host.dataset.judge;
+  var judgeName = host.dataset.judgeName;
+
+  /* The frozen probe set. Named for what each one perturbs rather than for the terms in
+     the literature: "position bias" and "verbosity bias" are defined for pairwise judges
+     ("here are A and B, which is better?"), and this judge is a pointwise absolute grader
+     with no A and no B. Borrowing the names would claim a protocol that was never run. */
+  var PROBES = [
+    {
+      key: "order",
+      title: "Order sensitivity",
+      perturbs: "Prompt sections are re-ordered. The transcript is never re-ordered — " +
+                "re-ordering an agent's steps changes what the agent did, which is a " +
+                "different run rather than the same run seen differently."
+    },
+    {
+      key: "length",
+      title: "Length sensitivity",
+      perturbs: "Filler is appended to agent turns, in a dose ladder. Perturbations may only " +
+                "add characters, never delete or rewrite them, so content preservation holds " +
+                "by construction rather than by an auditor's judgement."
+    }
+  ];
+
+  var OUTCOME_BADGE = {
+    /* A detected sensitivity is the finding, so it reads red. `not_applied` is amber
+       because it is a fault in the harness rather than in the judge, and colouring it
+       red would tell a reader that bias was found when nothing was measured at all.
+       `inconclusive` is deliberately grey: it is not a pass. */
+    biased: "verdict-fail",
+    inverse: "verdict-fail",
+    not_applied: "verdict-borderline",
+    inconclusive: "type-system"
+  };
+  var OUTCOME_WORD = {
+    biased: "sensitive",
+    inverse: "sensitive",
+    not_applied: "not applied",
+    inconclusive: "inconclusive"
+  };
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) { node.className = className; }
+    /* textContent throughout: judge names and rationales are stored text, and a
+       report is not a place to start interpreting markup. */
+    if (text !== undefined && text !== null) { node.textContent = text; }
+    return node;
+  }
+
+  function num(value, digits) {
+    return value === null || value === undefined ? "n/a" : value.toFixed(digits === undefined ? 3 : digits);
+  }
+
+  function delta(value) {
+    if (value === null || value === undefined) { return "n/a"; }
+    return (value < 0 ? "" : "+") + value.toFixed(3);
+  }
+
+  function pct(value) {
+    return value === null || value === undefined ? "n/a" : (value * 100).toFixed(1) + "%";
+  }
+
+  /* Signed for the shifts, where the direction is the whole claim and "-0.075" must not
+     look like "+0.075"; unsigned for the disagreement rates, which cannot be negative. */
+  function interval(low, high, signed) {
+    if (low === null || low === undefined || high === null || high === undefined) { return "n/a"; }
+    var fmt = signed === false ? num : delta;
+    return "[" + fmt(low) + ", " + fmt(high) + "]";
+  }
+
+  function stat(name, value, note) {
+    var box = el("div", "stat");
+    box.appendChild(el("div", "name", name));
+    box.appendChild(el("div", "value", value));
+    box.appendChild(el("div", "note", note));
+    return box;
+  }
+
+  function cell(row, text, className) {
+    row.appendChild(el("td", className, text));
+  }
+
+  /* The test-retest figure, rendered as the headline it is rather than as a footnote
+     under the arms. It answers "does this judge give the same answer twice", which is
+     a result on its own, and it is the floor every arm below has to clear. */
+  function controlCard(report) {
+    var card = el("div", "card");
+    var headline = el("div", "headline");
+    headline.appendChild(el("span", "kappa", num(report.control_disagreement)));
+    headline.appendChild(el("span", "headline-label", "test-retest disagreement"));
+    card.appendChild(headline);
+    if (report.control_disagreement === null) {
+      card.appendChild(el("p", "muted headline-ci",
+        "Undefined: no trajectory has two usable identity draws, so this judge's own noise " +
+        "was never measured and the arms below have no floor to be read against."));
+    } else {
+      card.appendChild(el("p", "muted headline-ci",
+        "How often two identical prompts came back with different verdicts, over the distinct " +
+        "unordered pairs inside the control arm. Interval " +
+        interval(report.control_ci_low, report.control_ci_high, false) + " at " +
+        pct(report.adjusted_confidence) + "."));
+    }
+    var grid = el("div", "stat-grid");
+    grid.appendChild(stat("Sample", report.trajectories + " over " + report.tasks,
+      "trajectories over tasks; intervals resample tasks, so the task count is the n"));
+    grid.appendChild(stat("Repeats", report.repeats, "draws per arm, per trajectory"));
+    grid.appendChild(stat("Movers needed",
+      report.min_movers === null ? "n/a" : report.min_movers,
+      "before any interval at this n can exclude zero"));
+    grid.appendChild(stat("Interval level", pct(report.adjusted_confidence),
+      "Sidak-adjusted from " + pct(report.confidence) + " nominal"));
+    card.appendChild(grid);
+    return card;
+  }
+
+  function armsTable(report) {
+    var needed = report.min_movers === null ? "n/a" : String(report.min_movers);
+    var table = el("table", "queue");
+    var head = el("tr");
+    ["Arm", "Applied", "Measured", "Shift", "Interval", "Disagree", "Movers", "Needed", "Outcome"]
+      .forEach(function (name) { head.appendChild(el("th", null, name)); });
+    var thead = el("thead");
+    thead.appendChild(head);
+    table.appendChild(thead);
+
+    var body = el("tbody");
+    report.arms.forEach(function (arm) {
+      var row = el("tr");
+      cell(row, arm.variant, "mono");
+      cell(row, arm.applied_to + "/" + report.trajectories, "num");
+      /* Delivery is not measurement. The padded arms carry the longest prompts and lose
+         the most calls, so an arm can differ from the control everywhere and still have
+         answered nowhere; every column to the right is denominated in this one. */
+      cell(row, arm.measured_on + "/" + report.trajectories, "num");
+      cell(row, delta(arm.signed_shift), "num");
+      cell(row, interval(arm.shift_ci_low, arm.shift_ci_high), "num");
+      cell(row, num(arm.disagreement), "num");
+      /* An arm that measured nothing is dashed rather than zeroed: "0 moved of 4 needed"
+         is a sentence about a judge that held steady, and this arm either never asked it
+         anything or never got an answer back. */
+      cell(row, arm.measured_on === 0 ? "—" : String(arm.movers_observed), "num");
+      cell(row, arm.measured_on === 0 ? "—" : needed, "num");
+      var outcome = el("td");
+      outcome.appendChild(el("span", "badge " + (OUTCOME_BADGE[arm.outcome] || "type-system"),
+        OUTCOME_WORD[arm.outcome] || arm.outcome));
+      row.appendChild(outcome);
+      body.appendChild(row);
+    });
+    table.appendChild(body);
+    return table;
+  }
+
+  /* One sentence per arm, because a row of numbers does not interpret itself and an
+     unexplained "inconclusive" reads as "unbiased" to everyone who is not the author. */
+  function armNote(arm, report) {
+    /* "measured" rather than a bare count: the threshold beside it is set by the run's n,
+       so an arm that lost trajectories to failed calls can be unable to reach it however
+       its survivors behaved, and "2 of 2 moved (3 needed)" reads as a contradiction
+       unless the denominator says which two. */
+    var moved = arm.movers_observed + " of " + arm.measured_on + " measured trajectories moved";
+    var needed = report.min_movers === null ? "n/a" : report.min_movers;
+    if (arm.outcome === "not_applied") {
+      return "NOT APPLIED. The rendered prompt matched the control for every trajectory, so " +
+             "this arm measured nothing. That is a broken arm, not a judge that shrugged the " +
+             "perturbation off.";
+    }
+    /* The other way to measure nothing, and it must not borrow the first one's words:
+       the perturbation was delivered here, so naming the renderer would send a reader to
+       debug the half that worked. */
+    if (arm.measured_on === 0) {
+      return "NOT MEASURED. The perturbation reached the model on " + arm.applied_to +
+             " of " + report.trajectories + " trajectories, but none came back with a verdict " +
+             "on both sides, so there is no shift to report and nothing held still either. " +
+             "Read the failed calls, not this arm — a judge that never answered is not a " +
+             "judge that was unmoved.";
+    }
+    if (arm.outcome === "biased" || arm.outcome === "inverse") {
+      var direction = arm.outcome === "biased" ? "upward" : "downward";
+      var side = arm.outcome === "biased" ? "above" : "below";
+      return "SENSITIVE, " + direction + ". The shift is " + delta(arm.signed_shift) +
+             ", the whole interval lies " + side + " zero, and " + moved +
+             " (" + needed + " needed). " + arm.description;
+    }
+    if (!arm.power_limited) {
+      return "INCONCLUSIVE. " + moved + " (" + needed + " needed), but the interval straddles " +
+             "zero: the movement is no larger than resampling the tasks produces on its own.";
+    }
+    if (report.min_movers === null) {
+      return "INCONCLUSIVE, and no interval was possible. Fewer than two trajectories were " +
+             "measured, so nothing can be resampled at any effect size. Read it as " +
+             "‘not measured’, never as ‘unbiased’.";
+    }
+    return "INCONCLUSIVE, and the instrument could not have said otherwise. Only " + moved +
+           ", and this n needs " + needed + " before any interval can exclude zero — so an " +
+           "effect this small is invisible here however real it is. Read it as " +
+           "‘not measured’, never as ‘unbiased’.";
+  }
+
+  function armNotes(report) {
+    var list = el("ul", "fix-list");
+    report.arms.forEach(function (arm) {
+      var item = el("li");
+      item.appendChild(el("span", "mono", arm.variant));
+      item.appendChild(document.createTextNode(" — " + armNote(arm, report)));
+      list.appendChild(item);
+    });
+    return list;
+  }
+
+  function emptyState(probe, report) {
+    var card = el("div", "card empty-state");
+    /* `repeats` is zero only when no run was found at all — the runner refuses to record
+       one below two draws per arm — so it is what separates "never probed" from "probed,
+       but the store held no trajectories". Both have zero trajectories, and telling a
+       reader to import data when the real problem is that nobody ran the probe sends
+       them after the wrong fix. */
+    if (report && report.repeats > 0) {
+      card.appendChild(el("p", null,
+        "The probe ran, but no trajectory reached any arm, so every figure would be empty. " +
+        "A probe needs no human labels — it compares the judge with itself — but it " +
+        "does need trajectories. Import or replay some, then probe again."));
+    } else {
+      card.appendChild(el("p", null,
+        "No " + probe.key + " probe has run for this judge, so its test-retest floor, every " +
+        "shift and every interval are undefined. Zeros would read as a judge that passed a " +
+        "test nobody ran, so they are left out."));
+    }
+    card.appendChild(el("p", "label", "What fixes it"));
+    var list = el("ul", "fix-list");
+    if (report && report.repeats > 0) {
+      var source = el("li");
+      source.appendChild(el("code", null, "agentverdict import examples/sample_trajectories.jsonl"));
+      source.appendChild(document.createTextNode(" — or "));
+      source.appendChild(el("code", null, "agentverdict replay"));
+      source.appendChild(document.createTextNode(", to record fresh runs from the stored tasks."));
+      list.appendChild(source);
+    }
+    var item = el("li");
+    item.appendChild(el("code", null, "agentverdict probe " + judgeName + " --probe " + probe.key));
+    item.appendChild(document.createTextNode(
+      " — unlike calibrate, this one calls the model: every trajectory, under every arm, " +
+      "once per repeat. Pass --limit to try it on a slice first."));
+    list.appendChild(item);
+    card.appendChild(list);
+    return card;
+  }
+
+  function render(probe, report) {
+    var section = el("div");
+    section.appendChild(el("h3", null, probe.title));
+    section.appendChild(el("p", "muted", probe.perturbs));
+
+    if (!report || report.repeats === 0 || report.trajectories === 0) {
+      section.appendChild(emptyState(probe, report));
+      return section;
+    }
+
+    section.appendChild(controlCard(report));
+    section.appendChild(el("p", "muted matrix-axis",
+      "Each arm below is the same trajectories judged again under one perturbation, scored " +
+      "against the control. The headline is the signed shift along the ordinal verdict scale " +
+      "(fail 0.0, borderline 0.5, pass 1.0); the disagreement rate sits beside it as a " +
+      "secondary, because a flip rate responds to the judge's entropy rather than to bias. " +
+      "‘Movers’ against ‘needed’ is the power check: below the needed count, " +
+      "no interval could have excluded zero however large the effect."));
+    section.appendChild(armsTable(report));
+    section.appendChild(armNotes(report));
+
+    if (report.probe === "length" &&
+        report.arms.some(function (arm) {
+          return arm.outcome === "biased" || arm.outcome === "inverse";
+        })) {
+      section.appendChild(el("p", "muted",
+        "The rubric licenses some of this. ‘Excessive or confusing communication’ is a " +
+        "borderline criterion the judge is told to apply, and both annotators marked a " +
+        "verbose-but-correct run down for it unprompted. A downward shift under padding is a " +
+        "defect only where it exceeds what the rubric asks for."));
+    }
+
+    if (report.errors) {
+      section.appendChild(el("p", "muted",
+        report.errors + " judge call" + (report.errors === 1 ? "" : "s") + " failed and produced " +
+        "no verdict. Those draws are dropped rather than counted as agreement, so every figure " +
+        "here rests on fewer draws than the repeat count implies."));
+    }
+
+    var footer = el("p", "muted");
+    footer.appendChild(document.createTextNode(
+      "Rubric " + (report.judge_prompt_version || "unrecorded") + ". "));
+    var link = el("a", null, "raw JSON");
+    link.href = "/api/judges/" + encodeURIComponent(judgeId) + "/bias?probe=" +
+                encodeURIComponent(probe.key);
+    footer.appendChild(link);
+    section.appendChild(footer);
+    return section;
+  }
+
+  function failure(probe, detail) {
+    var section = el("div");
+    section.appendChild(el("h3", null, probe.title));
+    var card = el("div", "card empty-state");
+    card.appendChild(el("p", null,
+      "Could not read the stored " + probe.key + " probe: " + detail + ". Nothing is claimed " +
+      "about this judge either way — the panel failed to load, which is not a result."));
+    section.appendChild(card);
+    return section;
+  }
+
+  Promise.all(PROBES.map(function (probe) {
+    return fetch("/api/judges/" + encodeURIComponent(judgeId) + "/bias?probe=" +
+                 encodeURIComponent(probe.key), {headers: {"Accept": "application/json"}})
+      .then(function (response) {
+        if (!response.ok) { throw new Error("HTTP " + response.status); }
+        return response.json();
+      })
+      .then(function (report) { return render(probe, report); })
+      .catch(function (error) { return failure(probe, error.message); });
+  })).then(function (sections) {
+    host.textContent = "";
+    sections.forEach(function (section) { host.appendChild(section); });
+  });
+})();
+</script>
 {% endblock %}

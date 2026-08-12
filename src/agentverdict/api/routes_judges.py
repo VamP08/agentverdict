@@ -1,8 +1,10 @@
 """Read-only judge endpoints; judges are created via the CLI in M2.
 
-Calibration (M3) and run comparison (M5) are served from here too: both are pure
-analysis over stored verdicts and human labels, so these endpoints never call a
-model and need no API key — which is what makes them safe to call from CI.
+Calibration (M3), the bias probes (M3 part 2) and run comparison (M5) are served
+from here too. All three are pure analysis over rows that are already stored, so
+these endpoints never call a model and need no API key — which is what makes them
+safe to call from CI, and what keeps a page refresh from re-running a probe that
+costs tokens.
 """
 
 from typing import Annotated
@@ -11,11 +13,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from agentverdict.bias.runner import build_bias_probe_report
 from agentverdict.calibration.report import build_calibration_report
 from agentverdict.db import get_session
 from agentverdict.gating.compare import compare_runs
 from agentverdict.models import EvalRun, Judge, JudgeVerdict, Trajectory
-from agentverdict.schemas import CalibrationReport, JudgeRead, JudgeVerdictRead, RunComparison
+from agentverdict.schemas import (
+    BiasProbeReport,
+    CalibrationReport,
+    JudgeRead,
+    JudgeVerdictRead,
+    RunComparison,
+)
 
 router = APIRouter(prefix="/api", tags=["judges"])
 
@@ -92,6 +101,43 @@ def get_judge_calibration(
         task_key=task_key,
         annotators=annotator,
     )
+
+
+@router.get("/judges/{judge_id}/bias", response_model=BiasProbeReport)
+def get_judge_bias(
+    judge_id: str,
+    session: SessionDep,
+    probe: Annotated[
+        str,
+        Query(
+            description=(
+                "Which sensitivity to report: 'order' (the prompt's sections are "
+                "re-ordered) or 'length' (filler is appended to agent turns). One "
+                "report describes one probe, because their arms are not comparable."
+            )
+        ),
+    ] = "order",
+) -> BiasProbeReport:
+    """Read back the latest stored bias probe for a judge.
+
+    This endpoint reads probe rows and nothing else — it never calls a model, so
+    refreshing the calibration page costs nothing and cannot start a sweep. The
+    run it describes is the newest completed one, or the newest failed one when
+    none completed; `agentverdict probe` is what produces them.
+
+    A judge nobody has probed yet gets an empty report rather than an error: no
+    probe has run, which is a state to describe rather than a fault. Every
+    statistic in that report is null instead of zero, so a client cannot render it
+    as a judge that passed a test that was never administered. An unknown judge is
+    still a 404, and an unknown probe name a 400 naming the ones that exist —
+    answering a typo with an empty report would read exactly like a clean bill of
+    health.
+    """
+    judge = _get_judge_or_404(judge_id, session)
+    try:
+        return build_bias_probe_report(session, judge, probe=probe)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/comparisons", response_model=RunComparison)

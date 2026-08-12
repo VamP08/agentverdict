@@ -1,4 +1,4 @@
-"""Typer CLI: init-db, import, export, stats, serve, judge, replay, eval, calibrate, compare.
+"""Typer CLI: init-db, import, export, stats, serve, judge, replay, eval, calibrate, probe, compare.
 
 Schema creation goes through Alembic (``agentverdict.migrate``) so upgrades of an
 existing database work; ``db.init_db()`` remains the fast create_all path for tests.
@@ -7,7 +7,9 @@ Heavy or optional machinery — alembic, uvicorn, the agents package, the judgin
 package — is imported inside the command bodies so plain data commands start fast
 and work without a model API key. ``calibrate`` and ``compare`` are two of those
 key-free commands: they only read rows that are already stored, which is what
-makes them safe to run inside a CI gate.
+makes them safe to run inside a CI gate. ``probe`` is the exception in this family:
+it re-asks the judge about every stored trajectory under every arm, so it spends
+tokens and never belongs inside the gate.
 """
 
 from __future__ import annotations
@@ -26,8 +28,23 @@ from sqlalchemy.orm import Session
 
 from agentverdict.db import get_session_factory
 from agentverdict.importer import compute_stats, export_jsonl, import_jsonl
-from agentverdict.models import EvalRun, Judge, JudgeVerdict, Task, Trajectory
-from agentverdict.schemas import AgreementRead, CalibrationReport, ReplayReport, RunComparison
+from agentverdict.models import (
+    BiasProbeResult,
+    BiasProbeRun,
+    EvalRun,
+    Judge,
+    JudgeVerdict,
+    Task,
+    Trajectory,
+)
+from agentverdict.schemas import (
+    AgreementRead,
+    ArmOutcome,
+    BiasProbeReport,
+    CalibrationReport,
+    ReplayReport,
+    RunComparison,
+)
 
 if TYPE_CHECKING:  # import-time cost avoided; only needed for annotations
     from agentverdict.agents.base import AgentAdapter
@@ -54,6 +71,18 @@ EXIT_CANNOT_COMPARE = 2
 _TASK_DELTA_LIMIT = 15
 #: Width the excluded-task name lists wrap to, so a large suite stays readable.
 _EXCLUDED_WIDTH = 88
+
+#: Probe name -> what the report calls it. The literature's terms are for *pairwise*
+#: judges ("here are A and B, which is better?") and this judge is a pointwise
+#: absolute grader, so each probe is re-derived and named for what it actually
+#: perturbs rather than borrowing "position bias" and "verbosity bias".
+_PROBE_TITLES = {"order": "order sensitivity", "length": "length sensitivity"}
+#: Probe name -> what its arms do to the prompt, printed so a reader never has to
+#: guess what "reversed_context" meant.
+_PROBE_SUMMARY = {
+    "order": "prompt sections re-ordered; the transcript itself is never re-ordered",
+    "length": "filler appended to agent turns; nothing is deleted or rewritten",
+}
 
 app = typer.Typer(
     name="agentverdict",
@@ -177,6 +206,27 @@ def _judge_progress(position: int, total: int, trajectory: Trajectory, row: Judg
     typer.echo(f"  [{position}/{total}] {trajectory.task.key} {trajectory.id[:8]}: {outcome}")
 
 
+def _probe_progress(
+    position: int, total: int, trajectory: Trajectory, row: BiasProbeResult
+) -> None:
+    """Print one probe call as it lands, at one line per call rather than per trajectory.
+
+    A probe makes arms x repeats calls per trajectory, and the arm is the whole
+    point, so collapsing them to one line per trajectory would hide which arm was
+    running when a sweep stalled or started erroring.
+    """
+    if row.verdict is None and row.error is None:
+        # Neither judged nor failed: the delivery check found this arm rendering the
+        # control's bytes, so no call was made for it.
+        outcome = "not applied"
+    else:
+        outcome = row.verdict or f"ERROR: {(row.error or 'unknown')[:60]}"
+    typer.echo(
+        f"  [{position}/{total}] {trajectory.task.key} {trajectory.id[:8]}"
+        f"  {row.variant} r{row.repeat}: {outcome}"
+    )
+
+
 def _print_replay_summary(report: ReplayReport) -> None:
     noun = "trajectory" if report.trajectories_created == 1 else "trajectories"
     tasks = "task" if report.tasks_attempted == 1 else "tasks"
@@ -229,6 +279,25 @@ def _fmt_ci(low: float | None, high: float | None) -> str:
     if low is None or high is None:
         return "CI n/a"
     return f"95% CI [{low:.3f}, {high:.3f}]"
+
+
+def _fmt_interval(low: float | None, high: float | None, *, signed: bool = True) -> str:
+    """Bracketed interval, with no confidence level baked into the string.
+
+    ``_fmt_ci`` names 95% because that is the level ``calibrate`` and ``compare``
+    read their intervals at. A probe reads its intervals at the Sidak-adjusted
+    level instead, which depends on how many arms the run had, so the level is
+    printed once by the report rather than repeated wrongly on every row.
+
+    ``signed`` is on for the shifts, where the direction is the claim and "-0.075"
+    must not look like "+0.075", and off for the disagreement rates, which cannot
+    be negative and would only look odd carrying a plus sign.
+    """
+    if low is None or high is None:
+        return "n/a"
+    if signed:
+        return f"[{low:+.3f}, {high:+.3f}]"
+    return f"[{low:.3f}, {high:.3f}]"
 
 
 def _trim(text: str | None, width: int) -> str:
@@ -542,6 +611,287 @@ def _print_calibration_report(report: CalibrationReport) -> None:
     _print_human_ceiling(report)
     typer.echo("")
     _print_calibration_disagreements(report)
+
+
+def _print_probe_run_summary(run: BiasProbeRun) -> None:
+    """What the sweep cost, before the report says what it found."""
+    arms = len((run.meta or {}).get("arms") or ())
+    typer.echo(
+        f"Probe run {run.id[:8]} {run.status}: {run.trajectory_count} trajectories"
+        f" x {arms} arms x {run.repeats} repeats"
+    )
+    if run.error_count:
+        typer.echo(f"  errors      {run.error_count}")
+    typer.echo(f"  tokens      {run.input_tokens} in / {run.output_tokens} out")
+
+
+def _print_probe_header(report: BiasProbeReport) -> None:
+    title = _PROBE_TITLES.get(report.probe, report.probe)
+    typer.echo(f"Bias probe: judge '{report.judge_name}'  [{title}]")
+    if report.repeats:
+        typer.echo(f"  perturbs   {_PROBE_SUMMARY.get(report.probe, report.probe)}")
+        typer.echo(
+            f"  sample     {_count(report.trajectories, 'trajectory', 'trajectories')} over"
+            f" {_count(report.tasks, 'task', 'tasks')}, {report.repeats} repeats per arm"
+        )
+        # The cluster count is never left implicit. Trajectories replayed from one
+        # task share the prompt, the expected outcome and the tools block - exactly
+        # what the order probe permutes - so the bootstrap resamples tasks, and a
+        # reader who takes `trajectories` for the sample size reads every interval
+        # as far tighter than it is.
+        typer.echo("             intervals resample tasks, so the task count is the n behind them")
+        # "Same judge" is not the same claim as "same rubric" once the prompt is
+        # editable, and these numbers only describe the rubric that was in force.
+        typer.echo(f"  rubric     {report.judge_prompt_version or 'unrecorded'}")
+    stamp = report.generated_at
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone(UTC)
+    typer.echo(f"  generated  {stamp:%Y-%m-%d %H:%M:%S} UTC")
+
+
+def _print_probe_control(report: BiasProbeReport) -> None:
+    """The judge's own test-retest noise, printed before any arm is discussed.
+
+    This is a finding in its own right and not a footnote to the arms: it is the
+    answer to "does this judge even give the same answer twice", and it is the
+    floor every shift below has to clear before it means anything.
+    """
+    typer.echo(f"Judge test-retest ({report.repeats} byte-identical calls per trajectory)")
+    typer.echo(
+        f"  disagreement  {_fmt_stat(report.control_disagreement):>6}"
+        f"   {_fmt_interval(report.control_ci_low, report.control_ci_high, signed=False)}"
+        f" at {report.adjusted_confidence:.1%}"
+    )
+    if report.control_disagreement is None:
+        typer.echo("  Undefined: no trajectory has two usable identity draws, so this judge's")
+        typer.echo("  own noise was never measured and the arms below have no floor to be read")
+        typer.echo("  against. Re-run the probe once the identity arm returns verdicts.")
+        return
+    typer.echo("  How often two identical prompts came back with different verdicts, over the")
+    typer.echo("  distinct unordered pairs within the control arm. Read every shift below")
+    typer.echo("  against it: movement smaller than the judge's own noise says nothing about")
+    typer.echo("  the perturbation.")
+
+
+def _probe_row(cells: tuple[str, ...], widths: list[int]) -> str:
+    """Lay one arm row out: the name and the outcome are words, everything between is a number.
+
+    Numbers that do not line up are numbers nobody scans, so only the two text
+    columns are left-aligned.
+    """
+    rendered = [
+        cell.ljust(width) if position in (0, len(cells) - 1) else cell.rjust(width)
+        for position, (cell, width) in enumerate(zip(cells, widths, strict=True))
+    ]
+    return "  " + "  ".join(rendered).rstrip()
+
+
+def _print_probe_arms(report: BiasProbeReport) -> None:
+    """One row per perturbed arm: the shift, its interval, and what powered it."""
+    needed = "n/a" if report.min_movers is None else str(report.min_movers)
+    headers = (
+        "arm",
+        "applied",
+        "measured",
+        "shift",
+        "interval",
+        "disagree",
+        "movers",
+        "needed",
+        "outcome",
+    )
+    rows = [
+        (
+            arm.variant,
+            f"{arm.applied_to}/{report.trajectories}",
+            f"{arm.measured_on}/{report.trajectories}",
+            _fmt_delta(arm.signed_shift),
+            _fmt_interval(arm.shift_ci_low, arm.shift_ci_high),
+            _fmt_stat(arm.disagreement),
+            # An arm that measured nothing is dashed rather than zeroed. "0 moved of 4
+            # needed" is a sentence about a judge that held steady, and this arm either
+            # never asked it anything or never got an answer back.
+            "-" if arm.measured_on == 0 else str(arm.movers_observed),
+            "-" if arm.measured_on == 0 else needed,
+            arm.outcome,
+        )
+        for arm in report.arms
+    ]
+    typer.echo("Arms against the identity control (fail 0.0, borderline 0.5, pass 1.0)")
+    if not rows:
+        typer.echo("  This probe has no perturbed arms, so there is nothing to compare.")
+        return
+    widths = [
+        max(len(header), *(len(row[position]) for row in rows))
+        for position, header in enumerate(headers)
+    ]
+    typer.echo(_probe_row(headers, widths))
+    for row in rows:
+        typer.echo(_probe_row(row, widths))
+    typer.echo("  applied  trajectories whose rendered prompt actually differed from the control's")
+    typer.echo("  measured of those, the ones the judge answered on both sides, so a shift exists;")
+    typer.echo("           every column to its right is denominated in this, not in 'applied'")
+    typer.echo("  shift    the headline: mean signed movement along the verdict scale")
+    typer.echo("  disagree secondary: how often a control draw and an arm draw differ at all")
+    typer.echo("  movers   trajectories that moved; 'needed' is how many must move before a")
+    typer.echo("           bootstrap at this n can exclude zero, whatever the size of the effect")
+
+
+def _probe_arm_note(arm: ArmOutcome, report: BiasProbeReport) -> list[str]:
+    """The sentences that turn one arm's row into a claim, or into a refusal to make one."""
+    needed = report.min_movers
+    # "measured" rather than a bare count: the threshold beside it is set by the run's
+    # n, so an arm that lost trajectories to failed calls can be unable to reach it
+    # however its survivors behaved, and "2 of 2 moved (3 needed)" reads as a
+    # contradiction unless the denominator says which two.
+    moved = f"{arm.movers_observed} of {arm.measured_on} measured trajectories moved"
+    if arm.outcome == "not_applied":
+        return [
+            f"{arm.variant}: NOT APPLIED. The rendered prompt matched the control for every",
+            "  trajectory, so this arm measured nothing at all. That is a broken arm, not a",
+            "  judge that shrugged the perturbation off - fix the harness before reading it.",
+        ]
+    if arm.measured_on == 0:
+        # The other way to measure nothing, and it must not borrow the vocabulary of
+        # the first: the perturbation was delivered here, so pointing the reader at the
+        # renderer would send them to debug the half that worked.
+        return [
+            f"{arm.variant}: NOT MEASURED. The perturbation reached the model on"
+            f" {_count(arm.applied_to, 'trajectory', 'trajectories')},",
+            "  but no trajectory came back with a verdict on both sides, so there is no shift",
+            "  to report and nothing held still either. Read the failed calls below, not this",
+            "  arm - a judge that never answered is not a judge that was unmoved.",
+        ]
+    if arm.outcome in ("biased", "inverse"):
+        direction = "upward" if arm.outcome == "biased" else "downward"
+        side = "above" if arm.outcome == "biased" else "below"
+        return [
+            f"{arm.variant}: SENSITIVE, {direction}. The shift is"
+            f" {_fmt_delta(arm.signed_shift)}, the whole interval lies",
+            f"  {side} zero, and {moved} ({needed} needed).",
+            f"  {arm.description}",
+        ]
+    if not arm.power_limited:
+        return [
+            f"{arm.variant}: INCONCLUSIVE. {moved} ({needed} needed),",
+            "  but the interval straddles zero: the movement is no larger than resampling",
+            "  the tasks produces on its own.",
+        ]
+    if needed is None:
+        return [
+            f"{arm.variant}: INCONCLUSIVE, and no interval was possible. Fewer than two",
+            "  trajectories were measured, so nothing can be resampled at any effect size.",
+            "  Read it as 'not measured'. It is not 'unbiased'.",
+        ]
+    return [
+        f"{arm.variant}: INCONCLUSIVE, and the instrument could not have said otherwise.",
+        f"  Only {moved}, and this n needs {needed} before",
+        "  any interval can exclude zero - so an effect this small is invisible here",
+        "  however real it is. Read it as 'not measured'. It is not 'unbiased'.",
+    ]
+
+
+def _print_probe_arm_notes(report: BiasProbeReport) -> None:
+    if not report.arms:
+        return
+    typer.echo("Reading the arms")
+    for arm in report.arms:
+        for line in _probe_arm_note(arm, report):
+            typer.echo(f"  {line}")
+    if report.probe == "length" and any(
+        arm.outcome in ("biased", "inverse") for arm in report.arms
+    ):
+        # Length sensitivity is not assumed to be a defect. The judge's own rubric
+        # names "excessive or confusing communication" as a borderline criterion, and
+        # on the golden set both annotators independently marked a verbose-but-correct
+        # run down for it. Reporting obedience to the written rubric as bias would be
+        # the exact error this milestone exists to catch.
+        typer.echo("")
+        typer.echo("  The rubric licenses some of this. 'Excessive or confusing communication'")
+        typer.echo("  is a borderline criterion the judge is told to apply, and both annotators")
+        typer.echo("  marked a verbose-but-correct run down for it unprompted. A downward shift")
+        typer.echo("  under padding is a defect only where it exceeds what the rubric asks for.")
+
+
+def _print_probe_errors(report: BiasProbeReport) -> None:
+    """Disclose failed calls, because dropping them quietly flatters every arm."""
+    typer.echo("Failed calls")
+    typer.echo(
+        f"  {_count(report.errors, 'call', 'calls')} produced no verdict. Those draws are dropped"
+    )
+    typer.echo("  rather than counted as agreement, so every figure above rests on fewer draws")
+    typer.echo("  than the repeat count implies.")
+    if report.probe == "length":
+        typer.echo("  They are not spread evenly either: the padded arms carry the longest")
+        typer.echo("  prompts, so they lose the most draws exactly where the dose is largest.")
+
+
+def _print_probe_confidence(report: BiasProbeReport) -> None:
+    """Print the multiplicity correction rather than applying it silently."""
+    intervals = len(report.arms) + 1  # the perturbed arms, plus the test-retest floor
+    typer.echo("Confidence")
+    typer.echo(
+        f"  {report.confidence:.1%} nominal, every interval above read at"
+        f" {report.adjusted_confidence:.1%}"
+    )
+    typer.echo(
+        f"  (Sidak over {intervals} intervals: {_count(len(report.arms), 'arm', 'arms')}"
+        " plus the test-retest floor)."
+    )
+    typer.echo(
+        f"  Uncorrected, that many {report.confidence:.0%} intervals give a judge with no"
+        " sensitivity at"
+    )
+    typer.echo("  all a comfortable chance of looking sensitive in one of them.")
+
+
+def _print_probe_empty_state(report: BiasProbeReport) -> None:
+    """Explain that nothing has been measured, instead of rendering zeros."""
+    typer.echo("No probe results")
+    typer.echo(f"  Judge '{report.judge_name}' has no stored '{report.probe}' probe run, so its")
+    typer.echo("  test-retest floor, every shift and every interval are undefined. Zeros here")
+    typer.echo("  would read as a judge that passed a test nobody ran, so they are left out.")
+    typer.echo("")
+    typer.echo("Do this next")
+    typer.echo(f"  1. agentverdict probe {report.judge_name} --probe {report.probe}")
+    typer.echo("     Unlike calibrate and compare, this one calls the model: every trajectory,")
+    typer.echo("     under every arm, once per repeat. Use --limit to try it on a slice first.")
+
+
+def _print_probe_no_trajectories(report: BiasProbeReport) -> None:
+    """A run that had nothing to judge is not a run that found nothing."""
+    typer.echo("The probe ran, but there was nothing to judge")
+    typer.echo("  No trajectory reached any arm, so every arm is empty and no figure below it")
+    typer.echo("  would mean anything. A probe needs no human labels - it compares the judge")
+    typer.echo("  with itself - but it does need trajectories.")
+    typer.echo("")
+    typer.echo("Do this next")
+    typer.echo("  1. agentverdict import examples/sample_trajectories.jsonl")
+    typer.echo("     or agentverdict replay, to record fresh runs from the stored tasks")
+    typer.echo(f"  2. agentverdict probe {report.judge_name} --probe {report.probe}")
+
+
+def _print_probe_report(report: BiasProbeReport) -> None:
+    _print_probe_header(report)
+    typer.echo("")
+    # `repeats` is zero only when no run was found: the runner refuses to record one
+    # below two draws per arm.
+    if report.repeats == 0:
+        _print_probe_empty_state(report)
+        return
+    if report.trajectories == 0:
+        _print_probe_no_trajectories(report)
+        return
+    _print_probe_control(report)
+    typer.echo("")
+    _print_probe_arms(report)
+    typer.echo("")
+    _print_probe_arm_notes(report)
+    if report.errors:
+        typer.echo("")
+        _print_probe_errors(report)
+    typer.echo("")
+    _print_probe_confidence(report)
 
 
 def _print_comparison_header(comparison: RunComparison) -> None:
@@ -1044,6 +1394,93 @@ def calibrate(
         typer.echo(report.model_dump_json(indent=2))
         return
     _print_calibration_report(report)
+
+
+@app.command()
+def probe(
+    name: Annotated[str, typer.Argument(help="Name of a registered judge.")],
+    probe_name: Annotated[
+        str, typer.Option("--probe", help="Which sensitivity to measure: order or length.")
+    ] = "order",
+    limit: Annotated[
+        int | None, typer.Option(help="Probe at most this many trajectories.", min=1)
+    ] = None,
+    repeats: Annotated[
+        int, typer.Option(help="Draws per arm. Must be at least 2 (see the error).")
+    ] = 3,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the full report as JSON and nothing else.")
+    ] = False,
+) -> None:
+    """Measure where a judge is systematically wrong by re-asking it under perturbed prompts.
+
+    This command calls the model, which is why it is separate from calibrate and
+    never runs inside the merge gate: it makes trajectories x arms x repeats calls.
+    Nothing it produces enters judge_verdicts -- a verdict on a deliberately
+    reordered or padded transcript is not a verdict on the run -- so calibration and
+    the gate are unaffected by anything measured here.
+
+    The exit code stays zero whatever the probe finds. A detected sensitivity is a
+    measurement to act on, not a gate: blocking a merge on it would make probing a
+    judge more expensive than leaving it unexamined.
+    """
+    from agentverdict.bias.runner import (
+        MIN_REPEATS,
+        PROBES,
+        build_bias_probe_report,
+        run_probe,
+    )
+    from agentverdict.judging.client import JudgeClientError
+
+    # Both checks run before the database is opened, so a typo costs nothing and a
+    # run that cannot be interpreted is never started.
+    if probe_name not in PROBES:
+        typer.echo(
+            f"Unknown probe '{probe_name}'. Valid probes: {', '.join(PROBES)}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if repeats < MIN_REPEATS:
+        typer.echo(
+            f"--repeats must be at least {MIN_REPEATS}, got {repeats}. At one draw per arm the"
+            " identity arm has no within-arm pair, so the judge's own noise floor is undefined"
+            " and every shift would be measured against nothing.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        with _open_session() as session:
+            # Resolved before the announcement, so a mistyped judge name never reads
+            # as a sweep that started and then failed.
+            judge = _require_judge(session, name)
+            if not as_json:
+                title = _PROBE_TITLES.get(probe_name, probe_name)
+                typer.echo(f"Probing judge '{judge.name}' for {title}...")
+            run = run_probe(
+                session,
+                judge,
+                probe_name,
+                repeats=repeats,
+                limit=limit,
+                # Silent under --json, which is documented to print the report and
+                # nothing else.
+                on_progress=None if as_json else _probe_progress,
+            )
+            # Report the run just made rather than "the newest run for this judge",
+            # which is a different run the moment two jobs share a database.
+            report = build_bias_probe_report(session, judge, probe=probe_name, probe_run_id=run.id)
+    except JudgeClientError as exc:
+        typer.echo(f"Probe failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(report.model_dump_json(indent=2))
+        return
+    typer.echo("")
+    _print_probe_run_summary(run)
+    typer.echo("")
+    _print_probe_report(report)
 
 
 @app.command()

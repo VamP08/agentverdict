@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from agentverdict.judging.client import ChatResult, GroqChatClient, JudgeClientError
+from agentverdict.judging.client import GroqChatClient, JudgeClientError
 from agentverdict.judging.prompts import CORRECTION_PROMPT, PROMPT_VERSION, build_messages
 from agentverdict.models import EvalRun, HumanLabel, Judge, JudgeVerdict, Task, Trajectory, utcnow
 from agentverdict.schemas import JudgeDecision
@@ -35,21 +36,36 @@ def parse_decision(content: str) -> JudgeDecision:
         raise ValueError(f"judge JSON did not match the decision contract: {exc}") from exc
 
 
-def judge_trajectory(
+@dataclass(frozen=True)
+class JudgeCall:
+    """One completed judging call, with the corrective retry folded into the totals."""
+
+    decision: JudgeDecision
+    content: str  # the answer that parsed, which is what gets stored as the raw response
+    latency_ms: float
+    input_tokens: int
+    output_tokens: int
+    retried: bool
+
+
+def judge_messages(
     client: GroqChatClient,
     judge: Judge,
-    task: Task,
-    trajectory: Trajectory,
-) -> tuple[JudgeDecision, ChatResult, ChatResult | None]:
-    """Judge one trajectory, retrying once with a corrective message on bad JSON.
+    messages: list[dict[str, str]],
+) -> JudgeCall:
+    """Ask the judge about one already-rendered prompt, retrying once on malformed JSON.
 
-    Returns the decision, the first chat result, and the retry result (if one happened).
+    The single place that decides how this judge is called: which temperature, which
+    correction turn, how a two-call answer is totalled. ``judge_trajectory`` is this
+    function over the production prompt, and the bias probe is this function over a
+    deliberately perturbed one — so a probe can never end up measuring a judge that
+    production no longer runs.
     """
     temperature = float((judge.config or {}).get("temperature", 0.0))
-    messages = build_messages(task, trajectory)
     first = client.chat_json(judge.model, messages, temperature=temperature)
+    retry = None
     try:
-        return parse_decision(first.content), first, None
+        decision = parse_decision(first.content)
     except ValueError:
         retry_messages = [
             *messages,
@@ -57,7 +73,25 @@ def judge_trajectory(
             {"role": "user", "content": CORRECTION_PROMPT},
         ]
         retry = client.chat_json(judge.model, retry_messages, temperature=temperature)
-        return parse_decision(retry.content), first, retry
+        decision = parse_decision(retry.content)
+    return JudgeCall(
+        decision=decision,
+        content=(retry or first).content,
+        latency_ms=first.latency_ms + (retry.latency_ms if retry else 0.0),
+        input_tokens=first.input_tokens + (retry.input_tokens if retry else 0),
+        output_tokens=first.output_tokens + (retry.output_tokens if retry else 0),
+        retried=retry is not None,
+    )
+
+
+def judge_trajectory(
+    client: GroqChatClient,
+    judge: Judge,
+    task: Task,
+    trajectory: Trajectory,
+) -> JudgeCall:
+    """Judge one trajectory under the production prompt."""
+    return judge_messages(client, judge, build_messages(task, trajectory))
 
 
 def _human_majority(labels: list[HumanLabel]) -> str | None:
@@ -128,22 +162,19 @@ def run_eval(
                 eval_run=run, judge=judge, trajectory=trajectory, input_tokens=0, output_tokens=0
             )
             try:
-                decision, first, retry = judge_trajectory(
-                    client, judge, trajectory.task, trajectory
-                )
+                call = judge_trajectory(client, judge, trajectory.task, trajectory)
             except (JudgeClientError, ValueError) as exc:
                 verdict_row.error = str(exc)[:1000]
                 run.error_count += 1
             else:
+                decision = call.decision
                 verdict_row.verdict = decision.verdict
                 verdict_row.rationale = decision.rationale
                 verdict_row.rubric_scores = decision.rubric_scores
-                verdict_row.raw_response = {"content": (retry or first).content}
-                verdict_row.latency_ms = first.latency_ms + (retry.latency_ms if retry else 0.0)
-                verdict_row.input_tokens = first.input_tokens + (retry.input_tokens if retry else 0)
-                verdict_row.output_tokens = first.output_tokens + (
-                    retry.output_tokens if retry else 0
-                )
+                verdict_row.raw_response = {"content": call.content}
+                verdict_row.latency_ms = call.latency_ms
+                verdict_row.input_tokens = call.input_tokens
+                verdict_row.output_tokens = call.output_tokens
                 verdict_counts[decision.verdict] += 1
                 majority = _human_majority(trajectory.labels)
                 if majority is not None:

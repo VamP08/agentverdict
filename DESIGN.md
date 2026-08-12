@@ -274,6 +274,17 @@ corrected, because most of them are the errors this field actually makes.*
      `not_applied`, never `inconclusive`. Reporting a broken harness as "no bias detected" is the
      single easiest way for this whole milestone to be worthless.
 
+   There are two ways to measure nothing and they get separate names, because they send a reader
+   to different places. `not_applied` is a perturbation that never reached the judge — go and
+   debug the renderer. **`no_data`** is one that reached it and came back from nowhere: delivered
+   on every trajectory, and every call answering it failed — go and look at the error count. This
+   is the length probe's *expected* failure rather than an exotic one, since the padded arms carry
+   the longest prompts and a provider that rejects one rejects exactly one side of every pair.
+   Both are held apart from `inconclusive`, which in this report means a measurement that found
+   nothing; only that third one is evidence about the judge. Every figure beside an arm is
+   denominated in `measured_on`, never in `applied_to`: "0 of 6 moved" next to "applied 6/6" is a
+   statement about a judge that never answered, phrased as one about a judge that held steady.
+
 5. **Power is computed and printed, not hoped for.** With a percentile bootstrap over n items, if
    k items move and n−k sit at exactly zero, the resample distribution carries an atom at zero of
    size ((n−k)/n)^n. At n=13 that is 0.353 for k=1, 0.114 for k=2, 0.033 for k=3, 0.0084 for k=4

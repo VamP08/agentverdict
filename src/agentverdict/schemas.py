@@ -300,6 +300,113 @@ class CalibrationReport(BaseModel):
     disagreements_total: int = 0  # before `disagreements` was truncated for display
 
 
+# --- Bias probes (M3 part 2) -------------------------------------------------
+
+
+class ArmOutcome(BaseModel):
+    """One perturbed arm of a probe, scored against the identity arm.
+
+    The headline is `signed_shift`, the mean movement along the ordinal verdict
+    scale, because that is the shape of the claim being made: "the judge marks
+    padded transcripts down" is directional. `disagreement` sits beside it as a
+    secondary and never as a co-headline — a flip rate responds to the judge's
+    entropy rather than to bias, since a perturbation that scatters answers
+    symmetrically raises it while moving the distribution's centre not at all.
+    """
+
+    variant: str
+    description: str
+
+    # Trajectories whose rendered prompt actually differed from the identity arm's.
+    # Zero is `not_applied`, not `inconclusive`: reporting a harness that perturbed
+    # nothing as "no bias detected" is the single easiest way for a probe to be worse
+    # than useless.
+    applied_to: int = 0
+
+    # Of those, the trajectories that came back with a usable verdict on both sides, so
+    # a shift exists at all. Delivery is not measurement, and the gap between them is
+    # not exotic: the padded arms carry the longest prompts and lose the most calls, so
+    # an arm can be delivered everywhere and measured nowhere. Every figure below is
+    # denominated in this, never in `applied_to` — "0 of 13 moved" against an arm whose
+    # every call errored is a statement about a judge that held steady, made on
+    # evidence that does not exist.
+    measured_on: int = 0
+
+    signed_shift: float | None = None
+    shift_ci_low: float | None = None
+    shift_ci_high: float | None = None
+    disagreement: float | None = None
+
+    # Trajectories that moved at all, out of `measured_on`. A percentile bootstrap over
+    # a vector of mostly exact zeros cannot exclude zero until `min_movers` of them do,
+    # so this count is what separates "no effect" from "no power to see one".
+    movers_observed: int
+    #: Movers that had a human majority to be measured against, and which way they went.
+    #: A shift is a magnitude and a sign; it cannot distinguish the judge being knocked
+    #: off a verdict the annotators agreed with from being nudged onto one. Reported as
+    #: counts rather than a second interval: the arm already spends one, and buying a
+    #: diagnostic with family-wise error is a bad trade.
+    movers_labeled: int = 0
+    moved_toward_humans: int = 0
+    moved_away_from_humans: int = 0
+
+    #: ``not_applied`` means the perturbation never reached the judge; ``no_data`` means
+    #: it did and every call answering it failed. Both are distinguished from
+    #: ``inconclusive``, which is a measurement that found nothing, because only the
+    #: last of the three is evidence about the judge.
+    outcome: Literal[
+        "biased", "inverse", "inconclusive", "not_applied", "no_data"
+    ] = "inconclusive"
+    #: True when the arm came back `inconclusive` with fewer movers than the bootstrap
+    #: needs. "This instrument cannot see an effect this small" is a result; a silent
+    #: `inconclusive` that was never able to say anything else is not.
+    power_limited: bool = False
+
+
+class BiasProbeReport(BaseModel):
+    """Where a judge is systematically wrong, measured against itself.
+
+    A probe compares the judge with itself under prompts that differ in a way that
+    should not matter, so it needs no human labels and reads every stored
+    trajectory rather than the labeled slice. Everything the intervals rest on
+    travels with the report instead of being summarized away.
+    """
+
+    judge_id: str
+    judge_name: str
+    judge_prompt_version: str | None = None
+    probe: str
+
+    trajectories: int = 0
+    # The cluster count, never hidden. Trajectories replayed from one task share the
+    # prompt, the expected outcome and the tools block — exactly what the order probe
+    # permutes — so the bootstrap resamples tasks, and this is the n behind every
+    # interval below. Reporting only `trajectories` would read as 29 independent
+    # observations where there are 5.
+    tasks: int = 0
+    repeats: int = 0
+
+    # The identity arm: how often two byte-identical calls disagree. This is the
+    # judge's own noise floor, a headline in its own right, and the thing every shift
+    # below has to be read against.
+    control_disagreement: float | None = None
+    control_ci_low: float | None = None
+    control_ci_high: float | None = None
+
+    #: Movers needed before an interval can exclude zero at this n. Computable before
+    #: a single token is spent, and printed whether or not the probe finds anything.
+    min_movers: int | None = None
+    confidence: float = 0.95  # nominal, per interval
+    # Sidak-adjusted for the number of intervals in this run, and printed rather than
+    # applied quietly: several uncorrected 95% intervals give a perfectly unbiased
+    # judge a comfortable chance of looking biased somewhere.
+    adjusted_confidence: float = 0.95
+
+    arms: list[ArmOutcome] = Field(default_factory=list)
+    errors: int = 0  # judge calls that failed and produced no verdict
+    generated_at: datetime
+
+
 # --- Regression gating (M5) --------------------------------------------------
 
 

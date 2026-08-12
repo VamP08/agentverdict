@@ -175,6 +175,7 @@ class Judge(Base):
 
     eval_runs: Mapped[list[EvalRun]] = relationship(back_populates="judge")
     verdicts: Mapped[list[JudgeVerdict]] = relationship(back_populates="judge")
+    bias_probe_runs: Mapped[list[BiasProbeRun]] = relationship(back_populates="judge")
 
 
 class EvalRun(Base):
@@ -229,3 +230,75 @@ class JudgeVerdict(Base):
     eval_run: Mapped[EvalRun] = relationship(back_populates="verdicts")
     judge: Mapped[Judge] = relationship(back_populates="verdicts")
     trajectory: Mapped[Trajectory] = relationship(back_populates="judge_verdicts")
+
+
+class BiasProbeRun(Base):
+    """One bias probe: a judge re-asked about the same trajectories under perturbed prompts.
+
+    Deliberately a table of its own rather than an ``EvalRun`` carrying a flag. Eval
+    runs feed calibration and the regression gate, and a verdict on a transcript that
+    was reordered or padded on purpose is not a verdict on the run.
+    """
+
+    __tablename__ = "bias_probe_runs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    judge_id: Mapped[str] = mapped_column(ForeignKey("judges.id"), index=True)
+    probe: Mapped[str] = mapped_column(String(32))  # order | length
+    status: Mapped[str] = mapped_column(String(16), default="running")  # running|completed|failed
+    # No default: the arm size is the experiment, not a counter. A row claiming zero
+    # repeats would describe a run that made no calls, and the probe refuses to run
+    # below two in the first place (at R=1 the control arm measures nothing).
+    repeats: Mapped[int] = mapped_column(Integer)
+    trajectory_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, default=0)
+    # The *unperturbed* fingerprint (judging.prompts.PROMPT_VERSION), because the probe
+    # reports on the judge that runs in production; the departure from it is named per
+    # row by BiasProbeResult.variant. Nullable for the same reason it is on EvalRun.
+    judge_prompt_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    seed: Mapped[int] = mapped_column(Integer, default=0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+    judge: Mapped[Judge] = relationship(back_populates="bias_probe_runs")
+    results: Mapped[list[BiasProbeResult]] = relationship(
+        back_populates="probe_run", cascade="all, delete-orphan"
+    )
+
+
+class BiasProbeResult(Base):
+    """One judge call in one arm of a probe, or the failure that replaced it.
+
+    Parallel to ``JudgeVerdict`` and separate from it on purpose: nothing that queries
+    ``judge_verdicts`` may pick these rows up, whatever filter it forgets.
+    """
+
+    __tablename__ = "bias_probe_results"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    probe_run_id: Mapped[str] = mapped_column(ForeignKey("bias_probe_runs.id"), index=True)
+    trajectory_id: Mapped[str] = mapped_column(ForeignKey("trajectories.id"), index=True)
+    variant: Mapped[str] = mapped_column(String(32))  # identity | format_null | padded_2x | ...
+    repeat: Mapped[int] = mapped_column(Integer)  # 0-based draw within the arm
+    verdict: Mapped[str | None] = mapped_column(String(16), nullable=True)  # null when errored
+    # Kept for the same reason JudgeVerdict keeps it: a probe whose only output is a
+    # flip count says that a reading changed but never which one, so nobody can act on it.
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # sha256 of the rendered user message, and the delivery check: an arm that hashes to
+    # identity's never applied its perturbation and reports `not_applied`, never "no bias".
+    prompt_sha: Mapped[str] = mapped_column(String(64))
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+    probe_run: Mapped[BiasProbeRun] = relationship(back_populates="results")
+    # No `trajectory` relationship, deliberately. Assigning one would cascade the loaded
+    # Trajectory and its steps into the session that writes probe rows, which is the only
+    # route by which filler could ever reach the golden dataset. The foreign key is
+    # enough: these rows are written from the id alone and read back by joining.
