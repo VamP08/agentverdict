@@ -1,0 +1,31 @@
+# Render blueprint: a one-click hosted demo of the labeling UI and calibration lab.
+#
+# What it deploys: `agentverdict serve` against a copy of the demo seed database
+# (examples/demo.db, a snapshot of this repository's real golden dataset -- the
+# actual labels, judge verdicts, and calibration numbers the README screenshots
+# show). The copy lives on the instance's ephemeral disk, so anything a visitor
+# scribbles into the labeling form vanishes on the next restart or deploy; the
+# seed itself is never written to.
+#
+# What it deliberately does not have: an API key. The browser surfaces (labeling
+# queue, trajectory pages, calibration report) never call a model -- only
+# `eval`, `judge run`, and `probe` do, and none of those are reachable from the
+# web UI. A public sandbox should not hold a credential it does not need.
+#
+# Free-tier note: the instance sleeps when idle, so the first request after a
+# quiet spell takes ~30-60s to answer while it wakes. That is the plan, not a bug.
+
+services:
+  - type: web
+    name: agentverdict-demo
+    runtime: python
+    plan: free
+    buildCommand: pip install .
+    # Copy the seed to ephemeral disk before serving, so the tracked file stays
+    # pristine and a restart resets the sandbox to the recorded state.
+    startCommand: cp examples/demo.db /tmp/demo.db && agentverdict serve --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: AGENTVERDICT_DATABASE_URL
+        value: sqlite:////tmp/demo.db
+      - key: PYTHON_VERSION
+        value: 3.12.6

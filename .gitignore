@@ -16,9 +16,15 @@ venv/
 .env
 *.db
 *.sqlite3
+# The demo seed is the one deliberate exception: a snapshot of the real golden
+# dataset that the hosted demo serves, reset on every restart.
+!examples/demo.db
 
 # Editors / OS
 .vscode/
 .idea/
 Thumbs.db
 .DS_Store
+
+/docs/
+/CLAUDE.md

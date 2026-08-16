@@ -114,6 +114,15 @@ the dataset back out as a JSONL bundle.
 By default everything runs against a local SQLite file (`agentverdict.db`), so there is nothing
 else to set up.
 
+### Hosted demo
+
+The repository ships a Render blueprint ([render.yaml](render.yaml)) and a seeded demo database
+(`examples/demo.db` — a snapshot of this repository's own golden dataset, so the demo shows the
+real labels, verdicts, and calibration numbers behind the screenshots above). Deploying it is
+"New + → Blueprint" on a free Render account; the instance copies the seed to ephemeral disk on
+every start, so the sandbox resets itself and the seed is never written. The demo needs no API
+key: the browser surfaces never call a model.
+
 ### Tests and lint
 
 ```bash
