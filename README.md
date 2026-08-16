@@ -2,6 +2,9 @@
 
 **CI-native evaluation platform for tool-calling AI agents, with a human-calibrated judge.**
 
+![Calibration report: coverage, Cohen's kappa with a bootstrap interval, confusion matrix, and a
+warning that fires when one report spans two rubric versions](assets/calibration-report.png)
+
 ## Why
 
 Most teams shipping AI agents have solid observability and almost no evaluation. Industry
@@ -249,6 +252,9 @@ Three steps, and only the middle one costs money:
 
 1. **Label trajectories by hand.** `agentverdict serve`, then work the queue at
    <http://127.0.0.1:8000/label>. A few dozen labeled runs is enough to start.
+
+   ![A trajectory page: task prompt, expected outcome, and the full step-by-step transcript
+   with tool calls and results](assets/trajectory-transcript.png)
 2. **Judge the same trajectories.** `agentverdict eval --judge groq-70b --skip-replay` scores
    what is already in the store instead of replaying fresh, unlabeled runs.
 3. **Compare the two.** `agentverdict calibrate groq-70b`
@@ -390,6 +396,9 @@ three buckets, printed above the drill-down:
 - **undetermined** — the criterion overlap is too thin to attribute either way. One unanswered
   criterion out of five can carry a verdict alone, so these are never counted as evidence
   against either side; the fix is more labeling.
+
+![The label form: verdict with keyboard shortcuts, five optional criteria with yes/no/partly
+options, and a "did not arise" option for consent](assets/labeling-criteria.png)
 
 Absence is never zero anywhere in this: `consent_obtained` is omitted — by the judge, the
 labeling form, and the API alike — when a run took no irreversible action, because 0.0 *means*
