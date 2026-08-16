@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from agentverdict.models import EvalRun, HumanLabel, Judge, JudgeVerdict, Task, Trajectory
 
@@ -427,3 +428,132 @@ def test_calibration_detail_escapes_a_rationale_containing_markup(
 
 def test_calibration_detail_unknown_judge_returns_404(client: TestClient) -> None:
     assert client.get("/calibration/does-not-exist").status_code == 404
+
+
+# --- GET /calibration/{id}: the part-2 surfaces --------------------------------
+#
+# These mirror the CLI print tests in tests/test_calibration_criteria.py: the two
+# operator surfaces must say the same thing about the same data, and the assertions
+# that matter most are the empty states -- an unmeasured criterion rendered as a
+# zero reads as a finding, which is the failure the whole milestone refuses.
+
+
+def _rubric_scores(**answers: float) -> dict[str, float]:
+    return dict(answers)
+
+
+def test_calibration_page_attributes_a_rule_fault_and_renders_the_criteria_table(
+    client: TestClient,
+    make_judge: Callable[..., Judge],
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """The order-status-01 shape: identical criterion answers, split verdicts."""
+    judge = make_judge()
+    agreed = _rubric_scores(
+        goal_achieved=1.0, tools_correct=1.0, ended_waiting=1.0, communication_clear=1.0
+    )
+    rule = make_trajectory(task=make_task(key="order-status-01"))
+    make_label(rule, "momo", "pass", rubric_scores=agreed)
+    make_label(rule, "vamp", "pass", rubric_scores=agreed)
+    make_verdict(judge, rule, "borderline", rubric_scores=agreed)
+
+    html = client.get(f"/calibration/{judge.id}").text
+
+    assert "Per-criterion agreement" in html
+    for key in ("goal_achieved", "tools_correct", "ended_waiting", "communication_clear"):
+        assert key in html
+    assert "Rubric disagreements: 1 of" in html
+    assert "fix the rubric, not the" in html
+
+
+def test_calibration_page_says_unmeasured_rather_than_rendering_zero_kappas(
+    client: TestClient,
+    make_judge: Callable[..., Judge],
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """A round-one corpus: labels carry no criteria, so nothing is measured.
+
+    The guard being pinned: 'Rubric disagreements: n/a', never '0 of 1' -- a zero over
+    nothing would clear a rubric nobody checked.
+    """
+    judge = make_judge()
+    split = make_trajectory(task=make_task(key="refund-simple-01"))
+    make_label(split, "momo", "pass")
+    make_label(split, "vamp", "pass")
+    make_verdict(judge, split, "fail")
+
+    html = client.get(f"/calibration/{judge.id}").text
+
+    assert "Nothing measured yet" in html
+    assert "Rubric disagreements: n/a" in html
+    assert "Rubric disagreements: 0 of" not in html
+
+
+def test_calibration_page_renders_a_thin_overlap_as_undetermined(
+    client: TestClient,
+    make_judge: Callable[..., Judge],
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """One shared criterion cannot carry a rubric verdict; the split stays unplaced."""
+    judge = make_judge()
+    thin = make_trajectory(task=make_task(key="refund-undelivered-01"))
+    only_tools = _rubric_scores(tools_correct=1.0)
+    make_label(thin, "momo", "pass", rubric_scores=only_tools)
+    make_label(thin, "vamp", "pass", rubric_scores=only_tools)
+    make_verdict(
+        judge,
+        thin,
+        "fail",
+        rubric_scores=_rubric_scores(
+            goal_achieved=0.0,
+            tools_correct=1.0,
+            ended_waiting=0.0,
+            communication_clear=1.0,
+        ),
+    )
+
+    html = client.get(f"/calibration/{judge.id}").text
+
+    assert "Undetermined: 1 of" in html
+    assert "more labeling" in html
+
+
+def test_calibration_page_warns_before_any_statistic_when_rulebooks_mix(
+    client: TestClient,
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """A mixed-rulebook report warns at the top, where it can still prevent a misreading."""
+    from agentverdict.rubric import ensure_rubric
+
+    judge = make_judge()
+    rubric = ensure_rubric(session)
+
+    unversioned = make_trajectory(task=make_task(key="order-status-01"))
+    make_label(unversioned, "momo", "pass")  # round one: no rubric_id
+    make_verdict(judge, unversioned, "pass")
+
+    versioned = make_trajectory(task=make_task(key="refund-simple-01"))
+    make_label(versioned, "vamp", "pass", rubric_id=rubric.id)
+    make_verdict(judge, versioned, "pass")
+
+    html = client.get(f"/calibration/{judge.id}").text
+
+    assert "Warning:" in html
+    # Before every statistic: a reader who has taken the headline at face value cannot
+    # be un-misled by a footnote.
+    assert html.index("Warning:") < html.index("Coverage")
+    assert "unrecorded" in html

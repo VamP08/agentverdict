@@ -34,6 +34,7 @@ from agentverdict.models import (
     EvalRun,
     Judge,
     JudgeVerdict,
+    Rubric,
     Task,
     Trajectory,
 )
@@ -69,6 +70,10 @@ EXIT_CANNOT_COMPARE = 2
 
 #: Task rows printed by ``compare``; ``--json`` always carries every row.
 _TASK_DELTA_LIMIT = 15
+#: Width the rubric-mix warning wraps to: it is one long sentence by design (every
+#: surface prints it verbatim), and one unbroken line would be the easiest way to
+#: make sure nobody reads it.
+_WARNING_WIDTH = 88
 #: Width the excluded-task name lists wrap to, so a large suite stays readable.
 _EXCLUDED_WIDTH = 88
 
@@ -334,10 +339,34 @@ def _calibration_scope(report: CalibrationReport) -> str:
 def _print_calibration_header(report: CalibrationReport) -> None:
     typer.echo(f"Calibration: judge '{report.judge_name}'  [{report.judge_model}]")
     typer.echo(f"  scope      {_calibration_scope(report)}")
+    # The rulebooks are named, never averaged silently: a kappa computed across a
+    # rubric edit describes neither rulebook, and nothing else on the page would
+    # show the split.
+    rubrics = ", ".join(
+        f"{name} ({_count(count, 'label', 'labels')})"
+        for name, count in report.label_rubrics.items()
+    )
+    prompts = ", ".join(
+        f"{version} ({_count(count, 'verdict', 'verdicts')})"
+        for version, count in report.judge_prompt_versions.items()
+    )
+    typer.echo(f"  rubric     {rubrics or 'no labels in scope'}")
+    typer.echo(f"  prompt     {prompts or 'no verdicts in scope'}")
     stamp = report.generated_at
     if stamp.tzinfo is not None:
         stamp = stamp.astimezone(UTC)
     typer.echo(f"  generated  {stamp:%Y-%m-%d %H:%M:%S} UTC")
+    if report.rubric_warning:
+        # Verbatim, and before any statistic: a reader who has already taken the
+        # headline kappa at face value cannot be un-misled by a footnote.
+        typer.echo("")
+        for line in textwrap.wrap(
+            f"WARNING: {report.rubric_warning}",
+            width=_WARNING_WIDTH,
+            initial_indent="  ",
+            subsequent_indent="  ",
+        ):
+            typer.echo(line)
 
 
 def _print_calibration_coverage(report: CalibrationReport) -> None:
@@ -495,6 +524,104 @@ def _print_human_ceiling(report: CalibrationReport, *, reading_aid: bool = True)
         typer.echo("  annotator, so pairwise numbers set an unfairly low bar.")
 
 
+def _print_calibration_criteria(report: CalibrationReport) -> None:
+    """One row per rubric criterion, over the trajectories both sides scored it on.
+
+    The marginals sit beside kappa because a criterion nearly every run passes
+    degenerates: two raters who answer alike 29 times in 30 can still score near
+    zero, and only the counts separate that from a criterion they truly split on.
+    ``unanswered`` sits beside each n for the reason the coverage block exists at
+    all — a kappa computed on three trajectories must not be read as one computed
+    on all of them.
+    """
+    if not report.criteria:
+        return
+    typer.echo("Per-criterion agreement (judge vs the human panel, where both answered)")
+    if all(row.n == 0 for row in report.criteria):
+        # An empty table is a fact about the corpus, not about the judge: five n=0
+        # kappas would read as five criteria the two sides never once agreed on.
+        typer.echo("  Nothing measured yet: no compared trajectory carries criterion answers")
+        typer.echo("  from both sides, so these columns await annotator answers. Label a slice")
+        typer.echo("  with the criteria filled in, then rerun calibrate.")
+        return
+    headers = ("criterion", "n", "unanswered", "kappa", "agreement", "human 1.0", "judge 1.0")
+    rows = [
+        (
+            row.key,
+            str(row.n),
+            str(report.criteria_unanswered.get(row.key, 0)),
+            _fmt_stat(row.cohens_kappa),
+            _fmt_pct(row.observed_agreement),
+            str(row.human_positive),
+            str(row.judge_positive),
+        )
+        for row in report.criteria
+    ]
+    widths = [
+        max(len(header), *(len(row[position]) for row in rows))
+        for position, header in enumerate(headers)
+    ]
+
+    def line(cells: tuple[str, ...]) -> str:
+        # Only the key is a word; every column after it is a number, and numbers
+        # that do not line up are numbers nobody reads down.
+        return "  " + "  ".join(
+            cell.ljust(width) if position == 0 else cell.rjust(width)
+            for position, (cell, width) in enumerate(zip(cells, widths, strict=True))
+        )
+
+    typer.echo(line(headers))
+    for row in rows:
+        typer.echo(line(row))
+    typer.echo("  An unanswered criterion was excluded, never scored 0.0: absence means the")
+    typer.echo("  question did not arise. Read each kappa against the two counts beside it --")
+    typer.echo("  a criterion almost every run passes cannot produce a high one.")
+    if any(row.n and row.cohens_kappa is None for row in report.criteria):
+        # Otherwise the empty kappa reads as a broken statistic rather than the
+        # finding it is.
+        typer.echo("  A kappa of n/a beside a non-zero n means at least one side gave a single")
+        typer.echo("  answer throughout; chance agreement is then total, and the counts beside")
+        typer.echo("  it say the rest.")
+
+
+def _print_rule_disagreements(report: CalibrationReport) -> None:
+    """Which artifact the disagreements point at: the rubric, or the judge.
+
+    ``order-status-01`` is the case this block exists for. The judge's rationale
+    agreed with both annotators about every fact of the run and the verdicts
+    still split, so re-prompting the judge would have moved nothing: the rule
+    that turns answers into a verdict was what needed rewriting.
+    """
+    total = report.disagreements_total
+    rule = report.rule_disagreements
+    undetermined = report.rule_undetermined
+    perception = total - rule - undetermined
+    if all(row.n == 0 for row in report.criteria):
+        # The same corpus-level guard as the criteria table above, so the two blocks
+        # cannot contradict each other on one screen. Gating on the counts instead
+        # would also fire when every split is undetermined over a thin overlap --
+        # and that undetermined tally is a measured number, which prints below.
+        typer.echo("  Rubric disagreements: n/a. No compared trajectory carries criterion")
+        typer.echo("  answers from both sides, so none of these can be attributed to the rubric")
+        typer.echo("  or to the judge. Label a slice with the criteria filled in to place them.")
+        return
+    typer.echo(f"  Rubric disagreements: {rule} of {total}.")
+    if rule:
+        typer.echo("  On those, judge and annotators answered every criterion either side scored")
+        typer.echo("  identically and still returned different verdicts, so the difference lives")
+        typer.echo("  in the rule that turns answers into a verdict. A large count here says fix")
+        typer.echo("  the rubric, not the judge: re-prompting a judge that already reads the")
+        typer.echo("  runs as the annotators do moves nothing.")
+    if perception:
+        typer.echo(f"  Perception differences: {perception} of {total}. The two sides answered")
+        typer.echo("  some criterion differently, so they are reading the runs differently --")
+        typer.echo("  that is judge work (prompt, examples, model), not a rubric rewrite.")
+    if undetermined:
+        typer.echo(f"  Undetermined: {undetermined} of {total}. One side answered a criterion")
+        typer.echo("  the other left out, or neither answered any; those cannot be placed either")
+        typer.echo("  way, and the fix for them is more labeling rather than a rewrite.")
+
+
 def _print_calibration_disagreements(report: CalibrationReport) -> None:
     # The true count, not the length of a list that may have been truncated.
     total = report.disagreements_total
@@ -507,6 +634,9 @@ def _print_calibration_disagreements(report: CalibrationReport) -> None:
         typer.echo(f"Worst disagreements (showing {len(shown)} of {total}; --json prints all)")
     else:
         typer.echo(f"Worst disagreements ({total})")
+    # Above the rows, because it says how many of them are worth reading as judge
+    # errors before anyone reads the first rationale as one.
+    _print_rule_disagreements(report)
     keys = [_trim(row.task_key, _TASK_KEY_WIDTH) for row in shown]
     stub = max(len(key) for key in keys)
     verdicts = [f"human {row.human_verdict} vs judge {row.judge_verdict}" for row in shown]
@@ -609,6 +739,8 @@ def _print_calibration_report(report: CalibrationReport) -> None:
     _print_calibration_per_class(report.agreement)
     typer.echo("")
     _print_human_ceiling(report)
+    typer.echo("")
+    _print_calibration_criteria(report)
     typer.echo("")
     _print_calibration_disagreements(report)
 
@@ -1077,13 +1209,35 @@ def _print_comparison(comparison: RunComparison, *, fail_on_regression: bool) ->
         _print_excluded_tasks(comparison)
 
 
+def _ensured_rubric(session: Session) -> Rubric:
+    """The current rubric row, reporting drift as a fixable message rather than a trace.
+
+    Drift is a deployment fault: the stored row a version already points at describes
+    labeling that has been done under it, so the answer is always a version bump and
+    never an edit. Checking here is what moves the failure to the command that sets a
+    database up instead of to whoever presses save next.
+    """
+    from agentverdict.rubric import RubricDriftError, ensure_rubric
+
+    try:
+        return ensure_rubric(session)
+    except RubricDriftError as exc:
+        typer.echo(f"Rubric check failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @app.command("init-db")
 def init_db_cmd() -> None:
-    """Create or upgrade the database schema (safe to run repeatedly)."""
-    from agentverdict.migrate import upgrade_to_head
-
-    upgrade_to_head()
+    """Create or upgrade the schema and the rubric row (safe to run repeatedly)."""
+    # Seeded here rather than on first use: a deployment nobody has labeled yet
+    # still has a rulebook to name, and a criteria edit that forgot its version
+    # bump fails this command instead of the first annotator to press save --
+    # uncaught, the drift error is a 500 in the middle of a labeling session.
+    with _open_session() as session:
+        rubric = _ensured_rubric(session)
+        name, version, criteria_count = rubric.name, rubric.version, len(rubric.criteria)
     typer.echo("Database schema is up to date.")
+    typer.echo(f"Rubric: {name} v{version}, {criteria_count} criteria.")
 
 
 @app.command("import")
@@ -1533,9 +1687,13 @@ def serve(
     """Run the API and labeling UI with uvicorn."""
     import uvicorn
 
-    from agentverdict.migrate import upgrade_to_head
-
-    upgrade_to_head()
+    # The same tripwire init-db runs, because nothing guarantees init-db ran with this
+    # build: a drifted rubric caught here fails the deploy, not the first label
+    # submission after it. `_open_session` upgrades the schema on the way in.
+    with _open_session() as session:
+        rubric = _ensured_rubric(session)
+        name, version = rubric.name, rubric.version
+    typer.echo(f"Rubric {name} v{version} is in force.")
     uvicorn.run("agentverdict.api.app:app", host=host, port=port, reload=reload)
 
 

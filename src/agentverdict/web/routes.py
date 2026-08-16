@@ -18,7 +18,13 @@ from agentverdict.calibration.report import build_calibration_report
 from agentverdict.calibration.stats import VERDICT_ORDER, interpret_kappa
 from agentverdict.db import get_session
 from agentverdict.models import HumanLabel, Judge, JudgeVerdict, Step, Task, Trajectory
-from agentverdict.rubric import CRITERIA, ensure_rubric, score_label, validate_scores
+from agentverdict.rubric import (
+    CRITERIA,
+    RubricDriftError,
+    ensure_rubric,
+    score_label,
+    validate_scores,
+)
 from agentverdict.schemas import AgreementRead, TrajectorySummary
 
 VERDICTS = ("pass", "fail", "borderline")
@@ -360,7 +366,28 @@ def label_submit(
     # what lets a report say two rounds were collected under different rules instead of
     # averaging across a rubric change. Round-one labels carry no rubric_id at all, and
     # that gap is the honest record of rules that were never written down.
-    rubric = ensure_rubric(session)
+    try:
+        rubric = ensure_rubric(session)
+    except RubricDriftError:
+        # No label can be honestly stamped while the stored rulebook disagrees with the
+        # one on screen, so this submission could not save either way. But the annotator
+        # is not who fixes it: a bare 500 costs them the rationale they just typed, says
+        # nothing, and costs it again on every retry.
+        return _render_trajectory(
+            request,
+            session,
+            trajectory,
+            form_annotator=annotator,
+            form_verdict=verdict,
+            form_rationale=rationale,
+            form_scores=submitted,
+            form_error=(
+                "The stored rubric no longer matches the criteria this build defines, "
+                "so no label can be recorded against it. Nothing you typed is lost. "
+                "Ask an operator to run: agentverdict init-db"
+            ),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
     label = session.scalar(
         select(HumanLabel).where(

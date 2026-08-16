@@ -5,9 +5,12 @@ summarise it differently. These tests are about the two ways that shows up in th
 
 * a criterion one side did not answer is **excluded and counted**, never filled in with
   0.0 — absence says the question did not arise, and 0.0 says the agent failed it;
-* a verdict split where both sides answered every shared criterion alike is counted in
-  ``rule_disagreements``, because the difference then lives in the rule that turns answers
-  into a verdict rather than in anyone's perception of the run.
+* a verdict split where both sides answered every criterion either of them reached, and
+  answered all of it alike, is counted in ``rule_disagreements``, because the difference
+  then lives in the rule that turns answers into a verdict rather than in anyone's
+  perception of the run — while a split whose two sides were barely compared (a one-sided
+  criterion, or no shared answers at all) goes to ``rule_undetermined``, since a thin
+  overlap cannot carry the claim that the two sides read the run the same way.
 
 Everything is seeded into the test session; nothing here calls a model.
 """
@@ -18,6 +21,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from agentverdict.calibration.report import build_calibration_report
+from agentverdict.cli import _print_calibration_report
 from agentverdict.models import HumanLabel, Judge, JudgeVerdict, Task, Trajectory
 from agentverdict.rubric import CRITERIA, validate_scores
 from agentverdict.schemas import CalibrationReport, CriterionAgreement
@@ -255,6 +259,7 @@ def test_every_criterion_gets_a_row_even_when_nobody_answered_one(
     assert all(row.observed_agreement is None for row in report.criteria)
     assert report.criteria_unanswered == {c.key: 3 for c in CRITERIA}
     assert report.rule_disagreements == 0
+    assert report.rule_undetermined == 0  # only disagreements can be undetermined
 
 
 # --- rule disagreement vs. perception disagreement ---------------------------
@@ -318,8 +323,11 @@ def test_a_verdict_split_with_identical_criteria_is_counted_as_a_rubric_fault(
     assert report.compared == 3
     assert report.disagreements_total == 2
     assert report.rule_disagreements == 1
-    # The remainder is what is left for the judge to answer for. Reported as counts
-    # because the artifact to fix differs: the rubric for one, the judge for the other.
+    assert report.rule_undetermined == 0  # both splits here were fully measured
+    # With nothing undetermined, the remainder is what is left for the judge to answer
+    # for. Reported as counts because the artifact to fix differs: the rubric for one,
+    # the judge for the other. In general the remainder also holds the splits that could
+    # not be placed either way, which is why `rule_undetermined` travels with these two.
     assert report.disagreements_total - report.rule_disagreements == 1
 
     # The fact both sides agreed on, which is what makes the split provably a rule
@@ -358,3 +366,259 @@ def test_a_disagreement_with_no_shared_criteria_is_not_blamed_on_the_rubric(
 
     assert report.disagreements_total == 1
     assert report.rule_disagreements == 0
+    # This is the assertion that pins the both-sides-empty regression: with no gaps and
+    # no shared answers either, "shared covers everything answered" holds vacuously, and
+    # only the explicit empty-overlap check keeps round one out of the rubric bucket.
+    assert report.rule_undetermined == 1
+
+
+def test_a_split_over_one_shared_criterion_is_unmeasured_not_a_rubric_fault(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """One overlapping answer measures coverage, not the rule.
+
+    Every criterion is optional to an annotator, so a panel that ticks the one question
+    it is sure about and leaves the rest alone is the ordinary submission rather than a
+    degenerate one. Counted as a rubric fault, this trajectory reports a judge that read
+    the run as a total failure against a human `pass` — goal missed, no consent, ended
+    mid-air, rambling, none of it answered on the other side — as evidence the rulebook
+    needs rewriting, and sends a reader to bump PROMPT_VERSION over a judge that is
+    misreading runs.
+    """
+    judge = make_judge()
+    thin = make_trajectory(task=make_task(key="refund-simple-01"))
+    for annotator in ("momo", "vamp"):
+        make_label(thin, annotator, "pass", rubric_scores=_scores(tools_correct=1.0))
+    make_verdict(
+        judge,
+        thin,
+        "fail",
+        rubric_scores=_scores(
+            goal_achieved=0.0,
+            tools_correct=1.0,
+            consent_obtained=0.0,
+            ended_waiting=0.0,
+            communication_clear=0.0,
+        ),
+    )
+
+    report = build_calibration_report(session, judge)
+
+    assert report.disagreements_total == 1
+    assert report.rule_disagreements == 0
+    assert report.rule_undetermined == 1
+    # The one answer they do share is real and still counts where it belongs.
+    assert _criterion(report, "tools_correct").n == 1
+    assert report.criteria_unanswered["goal_achieved"] == 1
+
+
+def test_one_unshared_criterion_is_enough_to_withhold_the_rubric_verdict(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """The allowance for one-sided criteria is zero, and the first gap crosses it.
+
+    The thin-overlap case above has four gaps and would still be caught if the allowance
+    quietly grew; this one has exactly one, so it pins the threshold itself. With five
+    criteria a single unmeasured one is a fifth of the rubric, and ``ended_waiting``
+    alone is what rule 1 turns on — the whole verdict split can live in the one question
+    the two sides never both answered, agreement on everything shared notwithstanding.
+    """
+    judge = make_judge()
+    trajectory = make_trajectory(task=make_task(key="order-status-01"))
+    both = _scores(goal_achieved=1.0, tools_correct=1.0)
+    for annotator in ("momo", "vamp"):
+        make_label(trajectory, annotator, "pass", rubric_scores=both)
+    # The judge matches every shared answer and adds one nobody else gave.
+    make_verdict(
+        judge,
+        trajectory,
+        "borderline",
+        rubric_scores=_scores(goal_achieved=1.0, tools_correct=1.0, ended_waiting=1.0),
+    )
+
+    report = build_calibration_report(session, judge)
+
+    assert report.disagreements_total == 1
+    assert report.rule_disagreements == 0
+    assert report.rule_undetermined == 1
+
+
+# --- the calibrate text report ------------------------------------------------
+
+
+def test_cli_report_prints_the_criteria_table_and_attributes_the_splits(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The numbers this feature exists for reach the terminal, not just ``--json``.
+
+    ``rule_disagreements`` is the line that tells a reader which artifact to fix, and
+    the per-criterion rows are what the drill-down under them is read with. Computed,
+    serialised and never printed, both would leave the text report sending every reader
+    off to re-prompt a judge that already reads the runs as the annotators do.
+    """
+    # The corpus pinned above in the rubric-fault test: one rule split, one perception
+    # split, one settled trajectory.
+    judge = make_judge()
+    agreed = _scores(
+        goal_achieved=1.0, tools_correct=1.0, ended_waiting=1.0, communication_clear=1.0
+    )
+    rule = make_trajectory(task=make_task(key="order-status-01"))
+    make_label(rule, "momo", "pass", rubric_scores=agreed)
+    make_label(rule, "vamp", "pass", rubric_scores=agreed)
+    make_verdict(judge, rule, "borderline", rubric_scores=agreed)
+    perception = make_trajectory(task=make_task(key="refund-simple-01"))
+    read_as_done = _scores(goal_achieved=1.0, tools_correct=1.0)
+    make_label(perception, "momo", "pass", rubric_scores=read_as_done)
+    make_label(perception, "vamp", "pass", rubric_scores=read_as_done)
+    make_verdict(
+        judge,
+        perception,
+        "borderline",
+        rubric_scores=_scores(goal_achieved=0.5, tools_correct=1.0),
+    )
+    settled = make_trajectory(task=make_task(key="angry-customer-01"))
+    make_label(settled, "momo", "pass", rubric_scores=agreed)
+    make_verdict(judge, settled, "pass", rubric_scores=agreed)
+
+    _print_calibration_report(build_calibration_report(session, judge))
+
+    out = capsys.readouterr().out
+    lines = [" ".join(line.split()) for line in out.splitlines()]
+
+    assert out.isascii()
+    heading = "Per-criterion agreement (judge vs the human panel, where both answered)"
+    assert heading in lines
+    assert "criterion n unanswered kappa agreement human 1.0 judge 1.0" in lines
+    # Every criterion gets a row, the empty consent column included: omitting it would
+    # print a four-criterion rubric.
+    for criterion in CRITERIA:
+        assert any(line.startswith(f"{criterion.key} ") for line in lines)
+    assert "Nothing measured yet" not in out
+
+    # The attribution adds up in plain sight: 1 rule, 1 perception, nothing withheld.
+    assert "Rubric disagreements: 1 of 2." in lines
+    assert any(line.startswith("Perception differences: 1 of 2.") for line in lines)
+    assert not any(line.startswith("Undetermined:") for line in lines)
+
+    # The table sits between the human numbers and the drill-down it explains, and the
+    # attribution prints above the rationales — before anyone reads the first one as a
+    # judge error.
+    assert lines.index("Human agreement") < lines.index(heading)
+    assert lines.index(heading) < lines.index("Worst disagreements (2)")
+    assert lines.index("Worst disagreements (2)") < lines.index("Rubric disagreements: 1 of 2.")
+
+
+def test_cli_report_says_nothing_measured_instead_of_five_empty_kappa_rows(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Round one: verdicts to compare, criterion answers on neither side.
+
+    Five n=0 rows would read as five criteria the two sides never once agreed on, and
+    "Rubric disagreements: 0 of 1" would clear a rubric nobody measured. Both print an
+    empty state instead: a number computed over nothing has to say so.
+    """
+    judge = make_judge()
+    for verdict in ("pass", "pass", "fail"):
+        trajectory = make_trajectory()
+        make_label(trajectory, "momo", "pass")
+        make_verdict(judge, trajectory, verdict)
+
+    _print_calibration_report(build_calibration_report(session, judge))
+
+    out = capsys.readouterr().out
+    lines = [" ".join(line.split()) for line in out.splitlines()]
+
+    heading = "Per-criterion agreement (judge vs the human panel, where both answered)"
+    assert heading in lines
+    assert any(line.startswith("Nothing measured yet:") for line in lines)
+
+    # The empty state replaces the table outright: no criterion row prints anywhere in
+    # the report, and no kappa of any spelling is offered over the n=0 columns.
+    criteria_block = out.split("Per-criterion agreement", 1)[1].split("Worst disagreements", 1)[0]
+    for criterion in CRITERIA:
+        assert criterion.key not in out
+    assert "kappa" not in criteria_block
+    assert "unanswered" not in criteria_block
+
+    # The one split is unattributable and stays that way: n/a, never a zero that reads
+    # as a clean rubric.
+    assert any(line.startswith("Rubric disagreements: n/a.") for line in lines)
+    assert "Rubric disagreements: 0 of" not in out
+    assert not any(line.startswith("Perception differences:") for line in lines)
+    assert not any(line.startswith("Undetermined:") for line in lines)
+
+
+def test_cli_report_counts_a_thin_overlap_corpus_instead_of_calling_it_unmeasured(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_task: Callable[..., Task],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One shared answer is enough to retire n/a: the undetermined count is measured.
+
+    The n/a branch belongs to the corpus where nothing was answered on both sides. Gated
+    on the rule and perception counts instead, it also fires when every split is
+    undetermined over a partial overlap -- and then the same screen shows a criteria row
+    with n=1 three lines above a sentence claiming no trajectory carries shared answers,
+    while the measured undetermined tally reaches no reader at all.
+    """
+    judge = make_judge()
+    thin = make_trajectory(task=make_task(key="refund-simple-01"))
+    # The ordinary thin submission LABELING.md invites: the panel answers the one
+    # criterion it is sure about, the judge answers all five and reads the run as a
+    # total failure.
+    for annotator in ("momo", "vamp"):
+        make_label(thin, annotator, "pass", rubric_scores=_scores(tools_correct=1.0))
+    make_verdict(
+        judge,
+        thin,
+        "fail",
+        rubric_scores=_scores(
+            goal_achieved=0.0,
+            tools_correct=1.0,
+            consent_obtained=0.0,
+            ended_waiting=0.0,
+            communication_clear=0.0,
+        ),
+    )
+
+    _print_calibration_report(build_calibration_report(session, judge))
+
+    out = capsys.readouterr().out
+    lines = [" ".join(line.split()) for line in out.splitlines()]
+
+    # The table above the drill-down shows the shared answer as measured...
+    assert any(line.startswith("tools_correct 1 ") for line in lines)
+    assert "Nothing measured yet" not in out
+
+    # ...so the drill-down must count, not shrug: n/a would contradict that row, and
+    # the undetermined split is the number that says what to do next (label more).
+    assert "Rubric disagreements: n/a" not in out
+    assert "No compared trajectory carries" not in out
+    assert "Rubric disagreements: 0 of 1." in lines
+    assert any(line.startswith("Undetermined: 1 of 1.") for line in lines)
+    assert not any(line.startswith("Perception differences:") for line in lines)

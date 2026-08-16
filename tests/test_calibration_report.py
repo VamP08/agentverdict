@@ -14,7 +14,9 @@ import pytest
 from sqlalchemy.orm import Session
 
 from agentverdict.calibration.report import build_calibration_report, human_majority
-from agentverdict.models import EvalRun, HumanLabel, Judge, JudgeVerdict, Task, Trajectory
+from agentverdict.judging.prompts import PROMPT_VERSION
+from agentverdict.models import EvalRun, HumanLabel, Judge, JudgeVerdict, Rubric, Task, Trajectory
+from agentverdict.rubric import RUBRIC_NAME, RUBRIC_VERSION, ensure_rubric
 
 # Fixed timestamps make "most recent" a property of the data, not of clock speed.
 EARLIER = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
@@ -639,6 +641,11 @@ def test_empty_dataset_reports_undefined_not_zero(
     assert report.disagreements == []
     assert all(row.precision is None for row in report.agreement.per_class)
     assert all(row.support == 0 for row in report.agreement.per_class)
+    # Nothing in scope means no rulebook to name and, above all, no warning: a mismatch
+    # reported over an empty comparison would be a finding computed over nothing.
+    assert report.label_rubrics == {}
+    assert report.judge_prompt_versions == {}
+    assert report.rubric_warning is None
 
 
 def test_judged_but_unlabeled_reports_no_statistics(
@@ -659,3 +666,209 @@ def test_judged_but_unlabeled_reports_no_statistics(
     assert report.agreement.n == 0
     assert report.agreement.cohens_kappa is None
     assert report.agreement.observed_agreement is None
+
+
+# --- rubric provenance --------------------------------------------------------
+
+
+def test_report_names_both_rubric_rounds_and_warns_about_the_mix(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_eval_run: Callable[..., EvalRun],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """A report over round-one and round-two labels says so, in the data and in prose.
+
+    This is the exact averaging-across-a-rubric-change hazard the rubric_id column was
+    activated to prevent: one kappa over labels made under two rulebooks, with nothing
+    on the report indicating it. The warning annotates — it must never filter, because
+    quietly dropping a round would change the figures without saying which rulebook the
+    survivors describe.
+    """
+    judge = make_judge()
+    run = make_eval_run(judge, judge_prompt_version=PROMPT_VERSION)
+    in_force = f"{RUBRIC_NAME} v{RUBRIC_VERSION}"
+
+    round_one = make_trajectory()
+    make_label(round_one, "momo", "pass")  # rubric_id NULL: the pre-rubric round
+    make_verdict(judge, round_one, "pass", eval_run=run)
+
+    round_two = make_trajectory()
+    make_label(round_two, "momo", "pass", rubric_id=ensure_rubric(session).id)
+    make_verdict(judge, round_two, "pass", eval_run=run)
+
+    report = build_calibration_report(session, judge)
+
+    assert report.label_rubrics == {in_force: 1, "unrecorded": 1}
+    assert report.judge_prompt_versions == {PROMPT_VERSION: 2}
+    assert report.rubric_warning is not None
+    assert "2 rubric versions" in report.rubric_warning
+    assert in_force in report.rubric_warning
+    assert "unrecorded" in report.rubric_warning
+    assert report.rubric_warning.isascii()  # the CLI echoes it verbatim
+    # Provenance annotates; it never filters.
+    assert report.compared == 2
+
+
+def test_a_round_one_only_report_is_unrecorded_but_not_called_mixed(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_eval_run: Callable[..., EvalRun],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """The pre-rubric corpus is named for what it is without being told it is mixed.
+
+    A warning that fires on every round-one report would be read once and never again.
+    "unrecorded" in the tally is the honest statement; inventing a mismatch out of an
+    absence would be a finding computed over nothing.
+    """
+    judge = make_judge()
+    trajectory = make_trajectory()
+    make_label(trajectory, "momo", "pass")
+    run = make_eval_run(judge, judge_prompt_version=PROMPT_VERSION)
+    make_verdict(judge, trajectory, "pass", eval_run=run)
+    # A stamped label on a trajectory the judge never scored moves no figure in this
+    # report, so it must not put a second rulebook on it either.
+    unjudged = make_trajectory()
+    make_label(unjudged, "momo", "pass", rubric_id=ensure_rubric(session).id)
+
+    report = build_calibration_report(session, judge)
+
+    assert report.label_rubrics == {"unrecorded": 1}
+    assert report.judge_prompt_versions == {PROMPT_VERSION: 1}
+    assert report.rubric_warning is None
+
+
+def test_verdicts_from_two_prompts_are_counted_per_run_and_warned_about(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_eval_run: Callable[..., EvalRun],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """The prompt version comes from each verdict's run, never from the module constant.
+
+    A judge re-run after a prompt edit leaves verdicts graded under both fingerprints in
+    the store; the report has to count what each run recorded, or it would stamp today's
+    rules onto history.
+    """
+    judge = make_judge()
+    stale_hash = "aaaaaaaaaaaa"  # never a real fingerprint: PROMPT_VERSION would collide
+    first, second = make_trajectory(), make_trajectory()
+    make_label(first, "momo", "pass")
+    make_label(second, "momo", "pass")
+    make_verdict(
+        judge, first, "pass", eval_run=make_eval_run(judge, judge_prompt_version=stale_hash)
+    )
+    make_verdict(
+        judge, second, "pass", eval_run=make_eval_run(judge, judge_prompt_version=PROMPT_VERSION)
+    )
+
+    report = build_calibration_report(session, judge)
+
+    assert report.judge_prompt_versions == {PROMPT_VERSION: 1, stale_hash: 1}
+    assert report.rubric_warning is not None
+    assert "2 judge prompt versions" in report.rubric_warning
+    assert stale_hash in report.rubric_warning
+
+
+def test_an_unstamped_run_is_reported_unrecorded_never_a_mismatch(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """A run from before the version column existed is unknowable, not stale.
+
+    It may well have been graded by the prompt in force now; claiming otherwise would
+    invent the provenance the nullable column exists to refuse. The tally still says
+    "unrecorded", so nothing is hidden — it is just not called a conflict.
+    """
+    judge = make_judge()
+    trajectory = make_trajectory()
+    make_label(trajectory, "momo", "pass", rubric_id=ensure_rubric(session).id)
+    make_verdict(judge, trajectory, "pass")  # fixture default run carries no version
+
+    report = build_calibration_report(session, judge)
+
+    assert report.judge_prompt_versions == {"unrecorded": 1}
+    assert report.label_rubrics == {f"{RUBRIC_NAME} v{RUBRIC_VERSION}": 1}
+    assert report.rubric_warning is None
+
+
+def test_labels_under_a_superseded_rubric_version_warn_against_the_one_in_force(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_eval_run: Callable[..., EvalRun],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """A recorded-but-old rubric version is a fact, and the report says it plainly.
+
+    Unlike an unrecorded one, a label pointing at a superseded rubric row proves the
+    annotator was shown different rules than the ones now in force — that is stale by
+    evidence, not by assumption, and it warns even though the report itself spans only
+    one version.
+    """
+    judge = make_judge()
+    superseded = Rubric(name=RUBRIC_NAME, version=RUBRIC_VERSION - 1, criteria=[])
+    session.add(superseded)
+    session.commit()
+    trajectory = make_trajectory()
+    make_label(trajectory, "momo", "pass", rubric_id=superseded.id)
+    run = make_eval_run(judge, judge_prompt_version=PROMPT_VERSION)
+    make_verdict(judge, trajectory, "pass", eval_run=run)
+
+    report = build_calibration_report(session, judge)
+
+    assert report.label_rubrics == {f"{RUBRIC_NAME} v{RUBRIC_VERSION - 1}": 1}
+    assert report.rubric_warning is not None
+    assert f"rubric in force is {RUBRIC_NAME} v{RUBRIC_VERSION}" in report.rubric_warning
+    assert f"{RUBRIC_NAME} v{RUBRIC_VERSION - 1}" in report.rubric_warning
+
+
+def test_scoping_to_one_round_names_one_rulebook_and_drops_the_warning(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_eval_run: Callable[..., EvalRun],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+) -> None:
+    """The way out the warning names has to work: scope to one round, warning gone.
+
+    The annotator scope is how a second round is scored on its own. The label tally
+    follows the scope, because a label outside it moves no figure in the report; the
+    judge's prompt tally does not, because which prompt graded a verdict is a property
+    of the run it belongs to, not of whose labels are being compared against.
+    """
+    judge = make_judge()
+    run = make_eval_run(judge, judge_prompt_version=PROMPT_VERSION)
+    in_force = f"{RUBRIC_NAME} v{RUBRIC_VERSION}"
+
+    round_one = make_trajectory()
+    make_label(round_one, "momo", "pass")  # rubric_id NULL: the pre-rubric round
+    make_verdict(judge, round_one, "pass", eval_run=run)
+    round_two = make_trajectory()
+    make_label(round_two, "momo-r2", "pass", rubric_id=ensure_rubric(session).id)
+    make_verdict(judge, round_two, "pass", eval_run=run)
+
+    mixed = build_calibration_report(session, judge)
+    assert mixed.label_rubrics == {in_force: 1, "unrecorded": 1}
+    assert mixed.rubric_warning is not None
+
+    scoped = build_calibration_report(session, judge, annotators=["momo-r2"])
+
+    assert scoped.compared == 1
+    assert scoped.label_rubrics == {in_force: 1}
+    # Both verdicts stay: the judge side is scoped by judge and eval run, never by
+    # annotator, and both graded rows still stand behind the judge-side figures.
+    assert scoped.judge_prompt_versions == {PROMPT_VERSION: 2}
+    assert scoped.rubric_warning is None

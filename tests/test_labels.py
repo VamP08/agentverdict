@@ -189,3 +189,33 @@ def test_another_annotators_answers_are_never_prefilled(
     textarea = re.search(r'<textarea[^>]*name="rationale"[^>]*>(.*?)</textarea>', page.text, re.S)
     assert textarea is not None
     assert textarea.group(1).strip() == ""
+
+
+def test_an_api_label_that_scores_criteria_is_stamped_with_the_current_rubric(
+    client: TestClient,
+    make_trajectory: Callable[..., Trajectory],
+    session: Session,
+) -> None:
+    """Criteria answered under no named rulebook would be provenance-blind forever.
+
+    The web form stamps every save; an API caller scoring criteria gets the same
+    treatment. A bare verdict stays unstamped -- that is what a round-one label
+    legitimately looks like, and inventing provenance for it would claim the annotator
+    saw criteria that did not exist when they judged.
+    """
+    scored = make_trajectory()
+    bare = make_trajectory()
+
+    with_criteria = client.post(
+        f"/api/trajectories/{scored.id}/labels",
+        json={"annotator": "api-ann", "verdict": "pass", "rubric_scores": {"tools_correct": 1.0}},
+    )
+    verdict_only = client.post(
+        f"/api/trajectories/{bare.id}/labels",
+        json={"annotator": "api-ann", "verdict": "pass"},
+    )
+
+    assert with_criteria.status_code == 201
+    assert verdict_only.status_code == 201
+    assert with_criteria.json()["rubric_id"] is not None
+    assert verdict_only.json()["rubric_id"] is None

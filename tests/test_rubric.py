@@ -12,14 +12,19 @@ Offline: the one runner test drives a mock transport, and everything else is tex
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
+from typer.testing import CliRunner
 
+from agentverdict.cli import app as cli_app
+from agentverdict.config import get_settings
+from agentverdict.db import reset_engine
 from agentverdict.judging.client import GroqChatClient
 from agentverdict.judging.prompts import CORRECTION_PROMPT, SYSTEM_PROMPT
 from agentverdict.judging.runner import run_eval
@@ -192,6 +197,88 @@ def test_ensure_rubric_refuses_a_stored_row_that_no_longer_matches(session: Sess
     with pytest.raises(RubricDriftError) as raised:
         ensure_rubric(session)
     assert "Bump RUBRIC_VERSION" in str(raised.value)
+
+
+# --- init-db seeds the row ----------------------------------------------------
+
+
+@pytest.fixture
+def cli_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[sessionmaker[Session]]:
+    """Point the application's own settings at a scratch SQLite file, then restore.
+
+    The CLI resolves its database through ``get_settings``/``get_engine``, the same
+    way ``tests/test_gating_surfaces.py`` drives ``compare``. Nothing is migrated
+    here: creating the schema is ``init-db``'s job, and doing it for the command
+    would hide a command that stopped doing it.
+    """
+    url = f"sqlite:///{(tmp_path / 'init.db').as_posix()}"
+    monkeypatch.setenv("AGENTVERDICT_DATABASE_URL", url)
+    get_settings.cache_clear()
+    reset_engine()
+    engine = create_engine(url)
+    try:
+        yield sessionmaker(bind=engine)
+    finally:
+        engine.dispose()
+        reset_engine()
+        get_settings.cache_clear()
+
+
+def test_init_db_seeds_the_rubric_row_and_twice_means_once(
+    cli_db: sessionmaker[Session],
+) -> None:
+    """The row is provenance, so it has to exist before anyone can be shown the rules.
+
+    Left to the first label POST, a deployment nobody has annotated yet has no rulebook
+    to name, and an API client cannot stamp a ``rubric_id`` it has no way to look up.
+    And ``init-db`` runs on every deployment, so the second run has to find the first
+    run's row rather than duplicate it or fail.
+    """
+    runner = CliRunner()
+
+    first = runner.invoke(cli_app, ["init-db"])
+    assert first.exit_code == 0, first.output
+    assert "Database schema is up to date." in first.output
+    assert f"Rubric: {RUBRIC_NAME} v{RUBRIC_VERSION}, {len(CRITERIA)} criteria." in first.output
+
+    with cli_db() as db:
+        row = db.scalars(select(Rubric)).one()
+        assert (row.name, row.version) == (RUBRIC_NAME, RUBRIC_VERSION)
+        assert [entry["key"] for entry in row.criteria] == EXPECTED_KEYS
+
+    second = runner.invoke(cli_app, ["init-db"])
+    assert second.exit_code == 0, second.output
+    with cli_db() as db:
+        assert db.scalar(select(func.count()).select_from(Rubric)) == 1
+
+
+def test_init_db_reports_a_drifted_rubric_row_instead_of_a_traceback(
+    cli_db: sessionmaker[Session],
+) -> None:
+    """Drift fails the deploy step with the fix named, not the next labeling session.
+
+    Uncaught, ``RubricDriftError`` surfaces as a blank 500 in front of whichever
+    annotator presses save next, on every retry. ``init-db`` is where a criteria edit
+    that forgot its version bump should stop instead, and a stack trace is not a
+    message an operator can act on.
+    """
+    runner = CliRunner()
+    assert runner.invoke(cli_app, ["init-db"]).exit_code == 0
+    with cli_db() as db:
+        row = db.scalars(select(Rubric)).one()
+        row.criteria = [dict(entry, description="Older wording.") for entry in row.criteria]
+        db.commit()
+
+    result = runner.invoke(cli_app, ["init-db"])
+
+    assert result.exit_code == 1
+    assert "Rubric check failed" in result.output
+    assert "Bump RUBRIC_VERSION" in result.output
+    # The handled path: the message above is the whole output, the exception never
+    # escapes the command, and no success line prints beside the failure.
+    assert "Traceback" not in result.output
+    assert not isinstance(result.exception, RubricDriftError)
+    assert "Database schema is up to date." not in result.output
 
 
 # --- what counts as an answer ------------------------------------------------

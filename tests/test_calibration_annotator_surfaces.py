@@ -16,7 +16,9 @@ from sqlalchemy.orm import Session
 
 from agentverdict.calibration.report import build_calibration_report
 from agentverdict.cli import _print_calibration_report
+from agentverdict.judging.prompts import PROMPT_VERSION
 from agentverdict.models import EvalRun, HumanLabel, Judge, JudgeVerdict, Trajectory
+from agentverdict.rubric import RUBRIC_NAME, RUBRIC_VERSION, ensure_rubric
 
 #: The heading the per-rater table renders under, and the start of the next block.
 PER_RATER_HEADING = "<h2>Judge against each annotator</h2>"
@@ -328,3 +330,49 @@ def test_cli_report_blames_the_annotator_filter_for_an_empty_report(
     )
     # No per-rater block: there is no annotator in scope to compare against.
     assert not any("Judge against each annotator" in line for line in lines)
+
+
+def test_cli_report_warns_about_a_rubric_mix_until_the_scope_names_one_round(
+    session: Session,
+    make_judge: Callable[..., Judge],
+    make_eval_run: Callable[..., EvalRun],
+    make_trajectory: Callable[..., Trajectory],
+    make_label: Callable[..., HumanLabel],
+    make_verdict: Callable[..., JudgeVerdict],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The mixed-rounds warning prints before any statistic, and scoping clears it.
+
+    The warning's own advice is to scope the report to one annotation round, so the
+    annotator scope has to actually silence it: a warning that survived a reader
+    following its instructions would be read as noise from the second sighting on.
+    """
+    judge = make_judge()
+    run = make_eval_run(judge, judge_prompt_version=PROMPT_VERSION)
+    in_force = f"{RUBRIC_NAME} v{RUBRIC_VERSION}"
+    round_one = make_trajectory()
+    make_label(round_one, "vamp", "pass")  # rubric_id NULL: labeled before the rubric row
+    make_verdict(judge, round_one, "pass", eval_run=run)
+    round_two = make_trajectory()
+    make_label(round_two, "vamp-r2", "pass", rubric_id=ensure_rubric(session).id)
+    make_verdict(judge, round_two, "pass", eval_run=run)
+
+    _print_calibration_report(build_calibration_report(session, judge))
+
+    mixed = capsys.readouterr().out
+    lines = [" ".join(line.split()) for line in mixed.splitlines()]
+    assert mixed.isascii()
+    assert f"rubric {in_force} (1 label), unrecorded (1 label)" in lines
+    assert any(
+        line.startswith("WARNING: This report spans more than one rulebook") for line in lines
+    )
+    # Above the first statistic: a reader who has already taken the headline kappa at
+    # face value cannot be un-misled by a footnote.
+    assert mixed.index("WARNING") < mixed.index("Agreement with the human majority")
+
+    _print_calibration_report(build_calibration_report(session, judge, annotators=["vamp-r2"]))
+
+    scoped = capsys.readouterr().out
+    scoped_lines = [" ".join(line.split()) for line in scoped.splitlines()]
+    assert f"rubric {in_force} (1 label)" in scoped_lines
+    assert "WARNING" not in scoped

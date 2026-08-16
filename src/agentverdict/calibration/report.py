@@ -36,11 +36,22 @@ The report has five parts, each answering a different follow-up:
 * **per-criterion agreement** — the same statistics computed separately for each
   rubric criterion, over the trajectories where judge and humans both answered
   it, and with them ``rule_disagreements``: the trajectories where the two sides
-  answered every shared criterion identically and still returned different
-  verdicts. A verdict token is a summary of a reading, and two raters can read a
-  run the same way and summarise it differently — this section separates those
-  cases from genuine misreadings, which is the difference between fixing the
-  judge and fixing the rubric.
+  answered every criterion either of them reached identically and still returned
+  different verdicts. A verdict token is a summary of a reading, and two raters
+  can read a run the same way and summarise it differently — this section
+  separates those cases from genuine misreadings, which is the difference
+  between fixing the judge and fixing the rubric. A verdict split whose two
+  sides were barely compared — some criterion answered on one side only, or
+  none answered at all — goes to ``rule_undetermined`` instead: attributed to
+  neither artifact, because the honest fix for an unmeasured split is more
+  labeling.
+
+Every report also names the rulebooks behind it: which rubric version each
+in-scope label was made under, and which judge prompt graded each surviving
+verdict. A rubric edit re-grades the corpus, so a kappa averaged across one
+describes neither rulebook — the report counts both sides' versions and carries
+a single warning sentence when the figures span more than one rulebook, rather
+than leaving the split to be inferred from annotator names.
 
 A report can also be scoped to a named set of annotators. Once a rubric ambiguity
 is written down, a second annotation round measures a *different* thing than the
@@ -73,8 +84,25 @@ from agentverdict.calibration.stats import (
     cohens_kappa,
     observed_agreement,
 )
-from agentverdict.models import HumanLabel, Judge, JudgeVerdict, Task, Trajectory, utcnow
-from agentverdict.rubric import CRITERIA, CRITERIA_BY_KEY, SCORE_LABELS, score_label
+from agentverdict.judging.prompts import PROMPT_VERSION
+from agentverdict.models import (
+    EvalRun,
+    HumanLabel,
+    Judge,
+    JudgeVerdict,
+    Rubric,
+    Task,
+    Trajectory,
+    utcnow,
+)
+from agentverdict.rubric import (
+    CRITERIA,
+    CRITERIA_BY_KEY,
+    RUBRIC_NAME,
+    RUBRIC_VERSION,
+    SCORE_LABELS,
+    score_label,
+)
 from agentverdict.schemas import (
     AgreementRead,
     AnnotatorPairAgreement,
@@ -94,6 +122,20 @@ _VERDICT_INDEX: dict[str, int] = {label: index for index, label in enumerate(VER
 #: answered the same way every time — where kappa is undefined and prints nothing.
 _POSITIVE_ANSWER = score_label(1.0)
 
+#: How a rulebook nothing recorded is named, spelled as ``compare`` and the bias report
+#: already spell it. Round-one labels point at no rubric row because none existed when
+#: they were made, and runs from before ``eval_runs.judge_prompt_version`` was added
+#: carry no fingerprint. Both are rulebooks in their own right rather than missing
+#: fields, neither can be recovered after the fact, and the name cannot collide with a
+#: real version: rubrics render as ``name vN`` and prompt versions are hex digests.
+_UNRECORDED = "unrecorded"
+
+#: The rulebook this process grades by, as label provenance spells it. Its two halves
+#: cannot drift apart — ``judging/prompts.py`` renders :data:`CRITERIA` into the text
+#: ``PROMPT_VERSION`` hashes — so a stored version that differs from either half was in
+#: force at a different time.
+_IN_FORCE_RUBRIC = f"{RUBRIC_NAME} v{RUBRIC_VERSION}"
+
 
 @dataclass(frozen=True)
 class _JudgeCall:
@@ -103,6 +145,9 @@ class _JudgeCall:
     rationale: str | None
     task_key: str
     rubric_scores: Mapping[str, Any]
+    # The prompt that graded it, taken from the run rather than the module constant:
+    # the constant names today's rules and these rows are history.
+    prompt_version: str | None
 
 
 @dataclass(frozen=True)
@@ -117,6 +162,11 @@ class _ComparedItem:
     judge_rationale: str | None
     # ``key -> (human, judge)``, holding only the criteria both sides answered.
     criterion_answers: Mapping[str, tuple[str, str]]
+    # Criteria exactly one side answered, in rubric order. Not a comparison and not an
+    # absence either side can be held to: it is the part of the rubric this trajectory
+    # was never measured on, which is what stops a thin overlap from passing as a
+    # reading the two sides shared.
+    criterion_gaps: tuple[str, ...]
 
     @property
     def distance(self) -> int:
@@ -194,7 +244,9 @@ def _latest_judge_calls(
     Ordering by ``(created_at, id)`` keeps the choice deterministic when a batch
     lands on the same timestamp. Rows with a null verdict are recorded API
     failures rather than decisions: they never win the comparison, and they are
-    counted so a low sample size can be traced back to a flaky run.
+    counted so a low sample size can be traced back to a flaky run. The run's
+    prompt version rides along because which rulebook graded a verdict is a
+    property of the run it belongs to, not of the judge.
     """
     stmt = (
         select(
@@ -203,7 +255,12 @@ def _latest_judge_calls(
             JudgeVerdict.rationale,
             JudgeVerdict.rubric_scores,
             Task.key,
+            EvalRun.judge_prompt_version,
         )
+        # Inner join, safe because every verdict row carries a non-null eval_run_id;
+        # were that ever relaxed this must become an outer join or the orphaned
+        # verdicts would silently vanish from every calibration figure.
+        .join(EvalRun, JudgeVerdict.eval_run_id == EvalRun.id)
         .join(Trajectory, JudgeVerdict.trajectory_id == Trajectory.id)
         .join(Task, Trajectory.task_id == Task.id)
         .where(JudgeVerdict.judge_id == judge.id)
@@ -216,7 +273,7 @@ def _latest_judge_calls(
 
     calls: dict[str, _JudgeCall] = {}
     errors = 0
-    for trajectory_id, verdict, rationale, scores, key in session.execute(stmt):
+    for trajectory_id, verdict, rationale, scores, key, prompt_version in session.execute(stmt):
         if verdict is None:
             errors += 1
             continue
@@ -227,6 +284,7 @@ def _latest_judge_calls(
             task_key=key,
             # Verdicts recorded before the rubric was structured carry no scores at all.
             rubric_scores=scores or {},
+            prompt_version=prompt_version,
         )
     return calls, errors
 
@@ -469,10 +527,10 @@ def _human_criterion_answers(labels: Sequence[HumanLabel]) -> dict[str, str]:
     return {key: answer for key, answer in majorities.items() if answer is not None}
 
 
-def _shared_criterion_answers(
+def _compare_criteria(
     labels: Sequence[HumanLabel], judge_scores: Mapping[str, Any] | None
-) -> dict[str, tuple[str, str]]:
-    """``key -> (human, judge)`` for the criteria both sides actually answered.
+) -> tuple[dict[str, tuple[str, str]], tuple[str, ...]]:
+    """The criteria both sides answered, and the ones exactly one side did.
 
     A key one side left out is excluded, never filled in with 0.0. 0.0 is an answer —
     *the agent failed this* — and spending it on *the question did not arise* would book
@@ -480,14 +538,20 @@ def _shared_criterion_answers(
     two raters as agreeing about it. Human first, matching the ``(reference,
     comparison)`` order every statistic in this module takes; rubric order, so the rows
     downstream read in the order the rulebook and the labeling form ask the questions.
+
+    The excluded keys are returned rather than discarded. They are what separates *the
+    two sides answered the same* from *the two sides were barely compared*, and only
+    ``_rule_disagreements`` can tell those apart.
     """
     human = _human_criterion_answers(labels)
     judge = _answers(judge_scores)
-    return {
+    shared = {
         key: (human[key], judge[key])
         for key in CRITERIA_BY_KEY
         if key in human and key in judge
     }
+    gaps = tuple(key for key in CRITERIA_BY_KEY if (key in human) != (key in judge))
+    return shared, gaps
 
 
 def _criterion_agreement(
@@ -537,8 +601,22 @@ def _criterion_agreement(
     return rows, unanswered
 
 
-def _rule_disagreements(items: Sequence[_ComparedItem]) -> int:
-    """Verdict disagreements where both sides answered every shared criterion alike.
+#: How many one-sided criteria — answered by the judge or the panel but not both — a
+#: verdict split may carry and still be attributed to the rubric: none. The rubric-fault
+#: claim is "the two sides read the run identically and the rule split them", and it has
+#: to be earned on everything either side answered, not on whatever the two happened to
+#: overlap on. Every criterion is optional to an annotator (``LABELING.md`` says so in
+#: as many words), so an overlap of one is the ordinary submission rather than a
+#: degenerate one — and with five criteria, a single unmeasured one is a fifth of the
+#: rubric that can carry the whole verdict by itself (``ended_waiting`` alone is what
+#: rule 1 turns on). Any allowance above zero therefore re-admits the case this count
+#: exists to exclude: a judge that misread four criteria in five, reported as proof the
+#: rulebook is at fault.
+_RULE_MAX_ONE_SIDED_CRITERIA = 0
+
+
+def _rule_disagreements(items: Sequence[_ComparedItem]) -> tuple[int, int]:
+    """Split the verdict disagreements into rubric faults and unmeasured ones.
 
     These are not judge errors. The judge read the run exactly as the annotators did —
     same goal, same tools, same ending — and the two still landed on different verdicts,
@@ -557,17 +635,144 @@ def _rule_disagreements(items: Sequence[_ComparedItem]) -> int:
     opposite reading holds: the two sides are reading the runs differently, and the
     judge is what needs the work.
 
-    A trajectory whose two sides share no answered criterion cannot be placed either way
-    and is not counted. With nothing in common, *they agreed on everything* is vacuously
-    true, and round one — labeled before the criteria existed — would otherwise report
-    every disagreement it contains as a rubric fault.
+    Which is why the claim has to be earned on the whole rubric and not on whatever the
+    two sides happened to overlap on. Every criterion is optional to an annotator —
+    ``LABELING.md`` says so in as many words — so a trajectory where one annotator ticked
+    ``tools_correct`` and left the rest alone shares exactly one answer with a judge that
+    filled in all five. "They agreed on everything they both answered" is then a fact
+    about how little was compared, not about the rule, and counting it would report a
+    judge that misread four criteria out of five as evidence that the rulebook is at
+    fault. So a disagreement with more than :data:`_RULE_MAX_ONE_SIDED_CRITERIA`
+    one-sided criteria goes to the second count, and so does one with no shared criteria
+    at all — round one, labeled before the criteria existed, is 29 of those. Neither is
+    a rubric fault or a judge error: it is unmeasured, and it is reported as its own
+    number because the fix for it is more labeling rather than a rewrite of anything.
     """
-    return sum(
-        1
-        for item in items
-        if item.human_verdict != item.judge_verdict
-        and item.criterion_answers
-        and all(human == judge for human, judge in item.criterion_answers.values())
+    rubric = 0
+    undetermined = 0
+    for item in items:
+        if item.human_verdict == item.judge_verdict:
+            continue
+        # `not item.criterion_answers` is load-bearing: without it, a trajectory where
+        # NEITHER side scored anything has no gaps either, and "they agreed on every
+        # criterion" would hold vacuously for the whole pre-criteria corpus.
+        if len(item.criterion_gaps) > _RULE_MAX_ONE_SIDED_CRITERIA or not item.criterion_answers:
+            undetermined += 1
+        elif all(human == judge for human, judge in item.criterion_answers.values()):
+            rubric += 1
+    return rubric, undetermined
+
+
+def _label_rubrics(
+    session: Session,
+    labels_by_trajectory: Mapping[str, list[HumanLabel]],
+    judge_calls: Mapping[str, _JudgeCall],
+) -> dict[str, int]:
+    """Which rulebook each in-scope label was made under, as ``"name vN" -> labels``.
+
+    Scoped to the trajectories this judge scored, because that is the population every
+    agreement figure is computed over: a label on a trajectory nobody judged moves no
+    statistic here, and letting it name a second rubric would raise a warning about an
+    average that was never taken. Counted over labels rather than trajectories, because
+    a trajectory labeled in both rounds sits on both sides of a rubric change and a
+    per-trajectory count would have to pick one.
+
+    Labels pointing at no rubric row are counted under :data:`_UNRECORDED` rather than
+    dropped — they are round one, collected under rules that were never written down,
+    and they are the reason this function exists. A rubric id resolves to ``name vN``,
+    which a reader can place; a row deleted out from under a finished round falls back
+    to the raw id, still separating one round from another.
+    """
+    in_scope = [
+        label
+        for trajectory_id in judge_calls
+        for label in labels_by_trajectory.get(trajectory_id, ())
+    ]
+    ids = {label.rubric_id for label in in_scope if label.rubric_id is not None}
+    named: dict[str, str] = {}
+    if ids:
+        rows = session.execute(
+            select(Rubric.id, Rubric.name, Rubric.version).where(Rubric.id.in_(ids))
+        )
+        named = {row.id: f"{row.name} v{row.version}" for row in rows}
+    counts = Counter(
+        _UNRECORDED if label.rubric_id is None else named.get(label.rubric_id, label.rubric_id)
+        for label in in_scope
+    )
+    return dict(sorted(counts.items()))
+
+
+def _judge_prompt_versions(judge_calls: Mapping[str, _JudgeCall]) -> dict[str, int]:
+    """The judge's side of the same question: prompt fingerprint -> verdicts it graded.
+
+    Counted over the surviving verdict per trajectory — the rows every figure in this
+    report is computed from — never over every row the judge ever wrote.
+    """
+    counts = Counter(call.prompt_version or _UNRECORDED for call in judge_calls.values())
+    return dict(sorted(counts.items()))
+
+
+def _rubric_warning(
+    label_rubrics: Mapping[str, int], judge_prompt_versions: Mapping[str, int]
+) -> str | None:
+    """What has to be said before a single number is quoted off this report, or None.
+
+    A rubric edit re-grades the corpus: figures made under different rulebooks are
+    different measurements, and an average of them describes no rulebook that ever
+    existed. That is the failure recorded in ``docs/rubric-change-2026-08-11.md`` and
+    the reason a label now carries the rubric it was made under. The split is stated as
+    one sentence every surface prints verbatim — the CLI, the web page and the raw JSON
+    must not each re-derive their own reading of it. The sentence names the split and
+    the ways out and stops there: scoping the report to one round, re-labeling and
+    re-judging are all valid answers, and only the caller knows which is affordable.
+
+    :data:`_UNRECORDED` is a rulebook of its own for the two *span* checks — a report
+    mixing round-one labels with stamped ones really does average across a rubric
+    change — but it is never called a mismatch against the version in force. An
+    unstamped run may well have been graded by the prompt in force now, and saying
+    otherwise would invent the provenance the nullable columns exist to refuse.
+    Returns None when either side is empty: with nothing compared there is no average
+    to warn about, and the empty state is already reported as such.
+    """
+    if not label_rubrics or not judge_prompt_versions:
+        return None
+    faults: list[str] = []
+    if len(label_rubrics) > 1:
+        faults.append(
+            f"labels were made under {len(label_rubrics)} rubric versions"
+            f" ({', '.join(label_rubrics)})"
+        )
+    if len(judge_prompt_versions) > 1:
+        faults.append(
+            f"verdicts were graded under {len(judge_prompt_versions)} judge prompt versions"
+            f" ({', '.join(judge_prompt_versions)})"
+        )
+    stale_rubrics = [
+        version for version in label_rubrics if version not in (_UNRECORDED, _IN_FORCE_RUBRIC)
+    ]
+    if stale_rubrics:
+        faults.append(
+            f"the rubric in force is {_IN_FORCE_RUBRIC} and these labels answer"
+            f" {', '.join(stale_rubrics)}"
+        )
+    stale_prompts = [
+        version
+        for version in judge_prompt_versions
+        if version not in (_UNRECORDED, PROMPT_VERSION)
+    ]
+    if stale_prompts:
+        faults.append(
+            f"the judge prompt in force is {PROMPT_VERSION} and these verdicts were"
+            f" graded under {', '.join(stale_prompts)}"
+        )
+    if not faults:
+        return None
+    return (
+        f"This report spans more than one rulebook: {'; '.join(faults)}. A rubric edit"
+        " re-grades the corpus, so figures made under different rulebooks are different"
+        " measurements and an average across them describes no rulebook that ever"
+        " existed. Scope the report to one annotation round or eval run, or re-label"
+        " and re-judge under the current rubric, before quoting a single number off it."
     )
 
 
@@ -628,6 +833,7 @@ def build_calibration_report(
         if call.verdict not in _VERDICT_INDEX:
             continue
         labels = labels_by_trajectory[trajectory_id]
+        shared, gaps = _compare_criteria(labels, call.rubric_scores)
         compared_items.append(
             _ComparedItem(
                 trajectory_id=trajectory_id,
@@ -636,7 +842,8 @@ def build_calibration_report(
                 judge_verdict=call.verdict,
                 annotators=tuple(sorted(label.annotator for label in labels)),
                 judge_rationale=call.rationale,
-                criterion_answers=_shared_criterion_answers(labels, call.rubric_scores),
+                criterion_answers=shared,
+                criterion_gaps=gaps,
             )
         )
     # A stable order keeps the seeded bootstrap reproducible across runs.
@@ -668,6 +875,9 @@ def build_calibration_report(
     criteria, criteria_unanswered = _criterion_agreement(
         compared_items, iterations=bootstrap_iterations, seed=seed
     )
+    rule_disagreements, rule_undetermined = _rule_disagreements(compared_items)
+    label_rubrics = _label_rubrics(session, labels_by_trajectory, judge_calls)
+    judge_prompt_versions = _judge_prompt_versions(judge_calls)
 
     return CalibrationReport(
         judge_id=judge.id,
@@ -712,5 +922,9 @@ def build_calibration_report(
         disagreements_total=len(disagreements),
         criteria=criteria,
         criteria_unanswered=criteria_unanswered,
-        rule_disagreements=_rule_disagreements(compared_items),
+        rule_disagreements=rule_disagreements,
+        rule_undetermined=rule_undetermined,
+        label_rubrics=label_rubrics,
+        judge_prompt_versions=judge_prompt_versions,
+        rubric_warning=_rubric_warning(label_rubrics, judge_prompt_versions),
     )

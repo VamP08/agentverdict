@@ -17,7 +17,19 @@
   {% if report.eval_run_id %}
     <span class="muted">&middot; eval run <span class="mono">{{ report.eval_run_id }}</span></span>
   {% endif %}
+  {% if report.label_rubrics %}
+    <span class="muted">&middot; rubric <span class="mono">{% for name, count in report.label_rubrics.items() %}{{ name }} ({{ count }} label{{ '' if count == 1 else 's' }}){{ ', ' if not loop.last }}{% endfor %}</span></span>
+  {% endif %}
+  {% if report.judge_prompt_versions %}
+    <span class="muted">&middot; prompt <span class="mono">{% for version, count in report.judge_prompt_versions.items() %}{{ version }} ({{ count }} verdict{{ '' if count == 1 else 's' }}){{ ', ' if not loop.last }}{% endfor %}</span></span>
+  {% endif %}
 </p>
+
+{% if report.rubric_warning %}
+{# Verbatim, and before any statistic: a reader who has already taken the headline kappa
+   at face value cannot be un-misled by a footnote. Same sentence as the CLI and the JSON. #}
+<div class="card warning"><p><strong>Warning:</strong> {{ report.rubric_warning }}</p></div>
+{% endif %}
 
 <h2>Coverage</h2>
 <div class="stat-grid">
@@ -160,6 +172,44 @@
     {% endfor %}
   </tbody>
 </table>
+
+{% if report.criteria %}
+<h2>Per-criterion agreement</h2>
+{% set criteria_measured = report.criteria | sum(attribute='n') %}
+{% if not criteria_measured %}
+{# The empty state replaces the table rather than annotating it: five n=0 rows
+   unexplained read as five criteria the two sides never once agreed on. #}
+<p class="muted">Nothing measured yet: no compared trajectory carries criterion answers
+from both sides, so these columns await annotator answers. Label a slice with the
+criteria filled in, then reopen this page.</p>
+{% else %}
+<p class="muted">The verdict says how far apart the judge and the humans are; these rows
+say about what. Each criterion is scored over the trajectories where both sides answered
+it &mdash; an unanswered criterion was excluded, never scored 0.0: absence means the
+question did not arise. Read each kappa against the two counts beside it; a criterion
+almost every run passes cannot produce a high one.</p>
+<table class="queue">
+  <thead><tr><th>Criterion</th><th>Answered by both</th><th>Unanswered</th><th>Raw agreement</th><th>Cohen's kappa</th><th>Humans said 1.0</th><th>Judge said 1.0</th></tr></thead>
+  <tbody>
+    {% for row in report.criteria %}
+    <tr>
+      <td title="{{ row.description }}"><span class="mono">{{ row.key }}</span></td>
+      <td class="num">{{ row.n }}</td>
+      <td class="num">{{ report.criteria_unanswered.get(row.key, 0) }}</td>
+      <td class="num">{{ row.observed_agreement | fmt_pct }}</td>
+      <td class="num">{{ row.cohens_kappa | fmt_num }}</td>
+      <td class="num">{{ row.human_positive }}</td>
+      <td class="num">{{ row.judge_positive }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% if report.criteria | selectattr('n') | selectattr('cohens_kappa', 'none') | list %}
+<p class="muted">A kappa of n/a beside a non-zero n means at least one side gave a single
+answer throughout; chance agreement is then total, and the counts beside it say the rest.</p>
+{% endif %}
+{% endif %}
+{% endif %}
 {% else %}
 <h2>Nothing to compare yet</h2>
 <div class="card empty-state">
@@ -324,6 +374,40 @@
 
 {% if report.compared %}
 <h2>Disagreements ({{ matrix.mismatched }})</h2>
+{% if report.disagreements_total %}
+{% set rule = report.rule_disagreements %}
+{% set undetermined = report.rule_undetermined %}
+{% set perception = report.disagreements_total - rule - undetermined %}
+{# Above the rows, because it says how many of them are worth reading as judge errors
+   before anyone reads the first rationale as one. Undetermined is its own bucket: the
+   remainder of the total is only a perception count when every disagreement was
+   measurable. #}
+{% if (report.criteria | sum(attribute='n')) == 0 %}
+{# The same corpus-level guard as the criteria table above, so the two blocks cannot
+   contradict each other on one screen. Gating on the counts instead would also swallow
+   an all-undetermined thin-overlap corpus, whose tally is a measured number. #}
+<p class="muted"><strong>Rubric disagreements: n/a.</strong> No compared trajectory
+carries criterion answers from both sides, so none of these can be attributed to the
+rubric or to the judge. Label a slice with the criteria filled in to place them.</p>
+{% else %}
+<p class="muted">
+  <strong>Rubric disagreements: {{ rule }} of {{ report.disagreements_total }}.</strong>
+  {% if rule %}On those, judge and annotators answered every criterion either side scored
+  identically and still returned different verdicts, so the difference lives in the rule
+  that turns answers into a verdict. A large count here says fix the rubric, not the
+  judge: re-prompting a judge that already reads the runs as the annotators do moves
+  nothing.{% endif %}
+  {% if perception %}<strong>Perception differences: {{ perception }} of
+  {{ report.disagreements_total }}.</strong> The two sides answered some criterion
+  differently, so they are reading the runs differently &mdash; that is judge work
+  (prompt, examples, model), not a rubric rewrite.{% endif %}
+  {% if undetermined %}<strong>Undetermined: {{ undetermined }} of
+  {{ report.disagreements_total }}.</strong> One side answered a criterion the other left
+  out, or neither answered any; those cannot be placed either way, and the fix for them
+  is more labeling rather than a rewrite.{% endif %}
+</p>
+{% endif %}
+{% endif %}
 {% if report.disagreements %}
 <p class="muted">
   Worst first by ordinal distance &mdash; a pass called a fail before a pass called borderline.

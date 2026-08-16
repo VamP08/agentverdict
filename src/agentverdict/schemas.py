@@ -346,11 +346,35 @@ class CalibrationReport(BaseModel):
     # computed on all of them.
     criteria_unanswered: dict[str, int] = Field(default_factory=dict)
 
-    # Trajectories where judge and humans answered every shared criterion identically and
-    # still reached different verdicts. That is the rubric's aggregation rule disagreeing
-    # with itself rather than the judge misreading the run — `order-status-01` is the case
-    # this whole structure exists to name — and it points at a different artifact to fix.
+    # Trajectories where judge and humans answered every criterion either side reached
+    # identically and still reached different verdicts. That is the rubric's aggregation
+    # rule disagreeing with itself rather than the judge misreading the run —
+    # `order-status-01` is the case this whole structure exists to name — and it points
+    # at a different artifact to fix. A reader who sees this high should rewrite the
+    # rubric rule, not re-prompt the judge.
     rule_disagreements: int = 0
+    # Verdict splits that could not be placed either way: one side answered a criterion
+    # the other left out, or neither answered any. Print it as its own line beside
+    # `rule_disagreements`, never folded into either bucket — the remainder of
+    # `disagreements_total` is only a judge-perception count when every disagreement was
+    # measurable, and the fix for these is more labeling rather than a rewrite of either
+    # the rubric or the judge.
+    rule_undetermined: int = 0
+
+    # The rulebooks behind every figure above. `label_rubrics` is "name vN" -> how many
+    # in-scope labels were made under it, with "unrecorded" covering round-one labels
+    # that predate the written rubric; `judge_prompt_versions` is the same shape over
+    # the prompt fingerprints that graded the surviving verdicts. Print both in the
+    # report header so a reader knows which rulebook each number describes; more than
+    # one key on a side means the report spans a rubric change.
+    label_rubrics: dict[str, int] = Field(default_factory=dict)
+    judge_prompt_versions: dict[str, int] = Field(default_factory=dict)
+    # Set when the two tallies above do not all read as the single rulebook now in
+    # force — averaging across two rulebooks measures neither. Print it verbatim and
+    # prominently, before any statistic; it is prose rather than a flag so the CLI, the
+    # web page and the raw JSON all say the same thing about the same split. None means
+    # one current rulebook produced everything in scope.
+    rubric_warning: str | None = None
 
 
 # --- Bias probes (M3 part 2) -------------------------------------------------

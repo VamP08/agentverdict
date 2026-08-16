@@ -51,6 +51,18 @@ def submit_label(trajectory_id: str, payload: LabelCreate, session: SessionDep) 
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
+    # A label that answers criteria was made under some rulebook, and which one is what
+    # lets a report refuse to average across a rubric change. The web form stamps the
+    # current rubric on every save; an API caller that scored criteria without naming a
+    # rubric gets the same treatment rather than arriving provenance-blind. A bare
+    # verdict is left unstamped -- that is what a round-one label legitimately looks
+    # like, and inventing provenance for it would claim the annotator saw criteria
+    # that did not exist when they judged.
+    rubric_id = payload.rubric_id
+    if rubric_id is None and scores:
+        from agentverdict.rubric import ensure_rubric
+
+        rubric_id = ensure_rubric(session).id
     label = session.scalar(
         select(HumanLabel).where(
             HumanLabel.trajectory_id == trajectory_id,
@@ -62,7 +74,7 @@ def submit_label(trajectory_id: str, payload: LabelCreate, session: SessionDep) 
             trajectory_id=trajectory_id,
             annotator=payload.annotator,
             verdict=payload.verdict,
-            rubric_id=payload.rubric_id,
+            rubric_id=rubric_id,
             rubric_scores=scores,
             rationale=payload.rationale,
             time_spent_s=payload.time_spent_s,
@@ -70,7 +82,7 @@ def submit_label(trajectory_id: str, payload: LabelCreate, session: SessionDep) 
         session.add(label)
     else:
         label.verdict = payload.verdict
-        label.rubric_id = payload.rubric_id
+        label.rubric_id = rubric_id
         label.rubric_scores = scores
         label.rationale = payload.rationale
         label.time_spent_s = payload.time_spent_s
