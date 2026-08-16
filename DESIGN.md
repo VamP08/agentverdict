@@ -14,8 +14,8 @@ update it deliberately when a decision changes.
 | # | Milestone | Status |
 |---|-----------|--------|
 | M1 | Golden-dataset workbench: tasks, trajectories, human labels; JSONL import/export; browser labeling UI | done |
-| M2 | Eval runner: replay tasks against agents, LLM-as-judge scoring via Groq | **in progress** |
-| M3 | Calibration lab: judge-vs-human agreement (kappa), position/verbosity/self-preference bias stats | **in progress** |
+| M2 | Eval runner: replay tasks against agents, LLM-as-judge scoring via Groq | done |
+| M3 | Calibration lab: judge-vs-human agreement (kappa), order/length sensitivity probes, per-criterion attribution | done (self-preference moved to M4) |
 | M4 | Distilled 4B judge: fine-tune on accumulated judgments, serve locally, publish to HF Hub | planned |
 | M5 | CI integration: GitHub Action, cost-bounded suites, bootstrapped confidence intervals, merge gating | **in progress** |
 | M6 | Public leaderboard + Langfuse online loop (production traces → new eval cases) | planned |
@@ -62,7 +62,7 @@ Two halves; the judging half ships first, the replay half second.
    `AGENTVERDICT_JUDGE_MODEL` (default `llama-3.3-70b-versatile`), base URL and timeout.
    Tests never hit the network: the client accepts an injected `httpx` transport.
 
-**Part 2 — task replay (in progress):**
+**Part 2 — task replay (shipped):**
 
 1. **Agent adapter contract** (`agents/base.py`, frozen) — `AgentAdapter` is a Protocol with a
    `name` and `run(task) -> AgentRunResult`; the result carries `steps` (list[StepIn]), `status`,
@@ -107,7 +107,7 @@ Two halves; the judging half ships first, the replay half second.
 
 ## M5 scope
 
-Part 1 (in progress) is the statistics and the gate; part 2 wires it into a packaged GitHub
+Part 1 (shipped) is the statistics and the gate; part 2 wires it into a packaged GitHub
 Action with cost ceilings.
 
 1. **Scoring a suite** — each verdict is worth `fail 0.0 / borderline 0.5 / pass 1.0`
@@ -195,8 +195,8 @@ Every rule here is also stated in the judge's system prompt (`judging/prompts.py
 
 ## M3 scope
 
-Part 1 answers *how much does the judge agree with us*; part 2 answers *where is it
-systematically wrong* — order sensitivity, length sensitivity, structured per-criterion
+Part 1 (shipped) answers *how much does the judge agree with us*; part 2 (shipped) answers
+*where is it systematically wrong* — order sensitivity, length sensitivity, structured per-criterion
 agreement, and rubric versioning. Self-preference is deliberately **not** in part 2; see the
 end of the part 2 section for why, and M4 for where it went.
 

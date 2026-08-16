@@ -31,7 +31,7 @@ Replay tasks against agents and score the results with an LLM judge.
       trajectories automatically
 - [x] `agentverdict eval` CLI combining replay + judging into one end-to-end suite run
 
-## M3 — Calibration lab (in progress)
+## M3 — Calibration lab (done; self-preference moved to M4)
 
 Measure the judge against the humans before trusting it.
 
@@ -40,20 +40,20 @@ Measure the judge against the humans before trusting it.
 - [x] Per-annotator comparison (the judge scored against each rater on exactly the items both
       rated, so judge and human numbers sit on the same sample) and `--annotator` scoping, so a
       re-labeled round is reported on its own while the first round is kept as-is
-- [ ] Order-sensitivity probe: does the verdict move when the prompt's context sections are
+- [x] Order-sensitivity probe: does the verdict move when the prompt's context sections are
       permuted but their content held byte-identical? (The pointwise analogue of position bias —
       this judge grades one trajectory at a time, so there is no candidate pair to swap.)
-- [ ] Length-sensitivity probe: does the verdict move under an append-only padding ladder, beyond
+- [x] Length-sensitivity probe: does the verdict move under an append-only padding ladder, beyond
       what the rubric already licenses?
-- [ ] Judge test-retest reliability, reported as a result in its own right rather than as a
+- [x] Judge test-retest reliability, reported as a result in its own right rather than as a
       nuisance parameter — the noise floor every probe above is measured against
-- [ ] Stated power on every probe: minimum detectable effect, movers observed against movers
+- [x] Stated power on every probe: minimum detectable effect, movers observed against movers
       required, and an explicit `power_limited` flag so "inconclusive" is never mistaken for
       "unbiased"
-- [ ] Per-criterion agreement: a structured rubric the judge and the annotators both fill in, so
+- [x] Per-criterion agreement: a structured rubric the judge and the annotators both fill in, so
       a disagreement can be localised to *reading the run differently* versus *mapping the same
       reading differently*
-- [ ] Rubric versioning activated, with calibration reports tied to a rubric version and a
+- [x] Rubric versioning activated, with calibration reports tied to a rubric version and a
       warning when one report spans two of them
 - [ ] ~~Self-preference analysis~~ — moved to M4. It needs a difference-in-differences estimator
       (the naive form measures judge leniency) and two judge families crossed over two agent

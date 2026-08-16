@@ -44,9 +44,9 @@ from the accumulated judgments, and the calibrated judge gates pull requests in 
 
 ## Current status
 
-**Milestone 1 — golden-dataset workbench** and **Milestone 2 — eval runner** are done,
-**Milestone 3 part 1 — judge calibration** has landed, and **Milestone 5 part 1 — the
-regression gate** now turns those calibrated verdicts into a merge decision. What works today:
+**Milestone 1 — golden-dataset workbench**, **Milestone 2 — eval runner**, and
+**Milestone 3 — the calibration lab** are done, and **Milestone 5 part 1 — the
+regression gate** turns those calibrated verdicts into a merge decision. What works today:
 
 - Trajectory store: tasks, multi-step trajectories, and human labels in SQLite or Postgres
 - JSONL import/export of trajectory bundles, with realistic sample data in `examples/`
@@ -63,18 +63,32 @@ regression gate** now turns those calibrated verdicts into a merge decision. Wha
   per-annotator comparison that puts judge and humans on identical items, and a ranked
   drill-down of every disagreement — on the CLI, over the API, and as a `/calibration` page in
   the browser
+- Bias probes: `agentverdict probe` measures the judge's order sensitivity (permuted prompt
+  sections, content byte-identical) and length sensitivity (an append-only padding ladder)
+  against the judge's own test-retest noise floor, with stated statistical power on every arm —
+  an underpowered result prints as "this instrument cannot see an effect this small", never as
+  "unbiased"
+- Per-criterion scoring: judge and annotators answer the same five structured questions
+  alongside the verdict, so a disagreement can be attributed — *they read the run differently*
+  (judge work) versus *they read it identically and the rules mapped it differently* (rubric
+  work) — with a third bucket for splits whose criterion overlap is too thin to attribute
+- Rubric versioning: labels record the rulebook they were made under, every eval run records
+  the judge-prompt fingerprint that graded it, and a report that spans two rulebooks warns
+  before its first statistic instead of averaging across them
 - Regression gate: `agentverdict compare` scores two eval runs, pairs them task by task,
   bootstraps the per-task deltas, and answers `regression` / `improvement` / `inconclusive` —
   blocking a merge only when the whole confidence interval sits below zero, on the CLI, over the
   API, and from a pull-request workflow that posts the summary
 - CLI: `init-db`, `import`, `export`, `stats`, `serve`, `judge`, `replay`, `eval`, `calibrate`,
-  `compare`
+  `probe`, `compare`
 - REST API under `/api`, test suite, CI workflow, docker-compose for Postgres
 
 The human-labeled dataset stays the ground truth throughout: the judge is scored against it,
 never the other way round, and the gate is only allowed to block on what that judge has been
-shown to measure. Bias analysis (position, verbosity, self-preference), the distilled local
-judge, and cost-bounded suites are later milestones; see [ROADMAP.md](ROADMAP.md).
+shown to measure. Self-preference analysis (which needs a correct difference-in-differences
+estimator and at least two judge families crossed over two agent families — the naive version
+measures leniency), the distilled local judge, and cost-bounded suites are later milestones;
+see [ROADMAP.md](ROADMAP.md).
 
 ## Quickstart
 
@@ -355,6 +369,85 @@ disagreement linking straight through to the trajectory.
 Until trajectories carry both a human label and a judge verdict there is nothing to pair up and
 every statistic is undefined. The report says so and names the two commands that fix it, rather
 than rendering zeros that look like findings.
+
+### Judging on the written remark, not just the verdict
+
+A verdict is one word, and one word cannot say *why* two raters disagreed. On a real run in this
+repository's dataset, the judge's rationale agreed with both annotators about every fact — the
+agent looked the order up, reported status and ETA exactly as asked — and the verdicts still
+split, because the disagreement lived in the rule that turns a reading into a verdict, not in the
+reading. Calibration recorded that as judge error. It was a rubric bug.
+
+So the judge and the annotators answer the same five structured questions alongside the verdict
+(goal achieved, tools correct, consent obtained, ended waiting on the customer, communication
+clear), and `calibrate` reports agreement per criterion. Every disagreement then lands in one of
+three buckets, printed above the drill-down:
+
+- **rubric disagreements** — identical criterion answers, different verdicts. The rule is at
+  fault; re-prompting a judge that already reads the runs as the annotators do moves nothing.
+- **perception differences** — some criterion answered differently. The judge is misreading
+  runs, and that is prompt/model work.
+- **undetermined** — the criterion overlap is too thin to attribute either way. One unanswered
+  criterion out of five can carry a verdict alone, so these are never counted as evidence
+  against either side; the fix is more labeling.
+
+Absence is never zero anywhere in this: `consent_obtained` is omitted — by the judge, the
+labeling form, and the API alike — when a run took no irreversible action, because 0.0 *means*
+"acted without agreement" and writing it for a read-only run would report a violation that never
+happened. A criterion answered by only one side is excluded from agreement and counted, never
+coerced.
+
+Every criterion is optional for annotators, and a bare verdict is still a complete label — the
+first labeling round predates these questions and remains fully valid. Labels record which
+rubric version was on screen; eval runs record the judge-prompt fingerprint that graded them; a
+report that spans two rulebooks says so before its first statistic, because an average across
+two rulebooks describes no rulebook that ever existed.
+
+## Probing the judge for bias
+
+Agreement statistics cannot see a judge that reads position instead of content — it can hit a
+respectable kappa while doing so. But the bias literature is written for **pairwise** judges
+("here are answers A and B, which is better?"), where position bias is measured by swapping A
+and B. This judge is a pointwise grader: one trajectory in, one verdict out. There is no A and
+no B, so the probes are re-derived for what this judge actually is, and named for what they
+actually measure:
+
+```bash
+agentverdict probe groq-70b --probe order   --repeats 3
+agentverdict probe groq-70b --probe length  --repeats 3
+```
+
+**Order sensitivity** permutes the prompt's context sections while holding every byte of their
+content fixed (the transcript itself is never reordered — reordering an agent's steps is a
+different run, not the same run seen differently). **Length sensitivity** appends semantically
+null filler to the agent's turns in escalating doses; perturbations may only ever add
+characters, so content preservation holds by construction. A `terse` mirror arm was considered
+and cut: on this corpus, truncating agent turns deletes the consent request or the closing
+question in most labeled runs — precisely the facts the rubric turns on — so a judge that
+downgrades the truncated run is judging *correctly*, and reporting that as bias would be the
+exact error the probe exists to catch.
+
+Every probe is measured against two controls: an identity arm re-judged verbatim (the judge's
+own test-retest noise floor, reported as a headline figure in its own right) and a format-null
+arm that is semantically identical but byte-different, separating raw prompt-format jitter from
+real order effects. A delivery check on the rendered prompt's hash distinguishes three ways of
+measuring nothing: `not_applied` (the perturbation never reached the judge — debug the
+harness), `no_data` (it did, and every call answering it failed — read the error count), and
+`inconclusive` (measured, nothing found). Only the last is evidence about the judge.
+
+The headline statistic is the signed ordinal shift, not a flip rate — a flip rate responds to
+the judge's *entropy*, and a perturbation that scatters answers symmetrically raises it without
+moving the verdict distribution at all. And every arm prints its own statistical power: with a
+percentile bootstrap over n items, no interval can exclude zero until four items move —
+essentially independent of n, since the resample's atom at zero tends to e^−k. So each arm
+reports movers observed against movers required, and an underpowered arm says plainly that the
+instrument cannot see an effect this small, which is not the same claim as "unbiased" and is
+never printed as if it were.
+
+Probe verdicts live in their own tables and never touch `judge_verdicts` — a verdict on a
+deliberately corrupted transcript is not a verdict on the run, and calibration and the merge
+gate must never ingest one. The golden dataset's byte-identity across a probe run is pinned by
+test.
 
 ## Gating a pull request
 

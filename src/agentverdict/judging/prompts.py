@@ -80,6 +80,19 @@ def _criteria_block() -> str:
     if any(0.5 in criterion.values for criterion in CRITERIA):
         guidance = "Where 0.5 is listed it means partly. " + guidance
     lines.append(guidance)
+    # Restated here, not only in the rules above, because it was measured failing: with
+    # the block present but this sentence absent, the judge marked ended_waiting 1.0 and
+    # then let that fact drag completed runs to "borderline" -- runs it had graded "pass"
+    # before the criteria existed. The general instruction two lines up did not survive
+    # contact with the one criterion that names the ending; the rule has to be re-anchored
+    # at the exact point where the fact is scored, or scoring the fact re-litigates it.
+    if "ended_waiting" in {criterion.key for criterion in CRITERIA}:
+        lines.append(
+            "In particular ended_waiting = 1.0 is a fact about where the transcript stops, "
+            "never a reason to lower the verdict: per the unfinished-conversations rule "
+            'above, an agent that did its part and stopped in the right place is a "pass" '
+            "even though ended_waiting is 1.0."
+        )
 
     optional = [criterion.key for criterion in CRITERIA if not criterion.applicable_always]
     if optional:
